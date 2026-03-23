@@ -10,12 +10,12 @@ if not exist "ztools-plugin-cli\" (
     exit /b 1
 )
 
-set REMOTE_URL=https://github.com/ZToolsCenter/ztools-plugin-cli.git
+set REMOTE_URL=https://github.com/zk3151463/ztools-plugin-cli.git
 
 echo 📍 目标仓库: %REMOTE_URL%
 echo.
 echo ⚠️  请确保：
-echo    1. 已在 GitHub 创建仓库: ZToolsCenter/ztools-plugin-cli
+echo    1. 已在 GitHub 创建仓库: zk3151463/ztools-plugin-cli
 echo    2. 仓库设置为 Public 或 Private（推荐 Public）
 echo    3. 没有初始化 README、.gitignore、license
 echo.
@@ -40,7 +40,7 @@ echo.
 echo ✅ 发布完成！
 echo.
 echo 📝 下一步：
-echo    1. 访问 https://github.com/ZToolsCenter/ztools-plugin-cli
+echo    1. 访问 https://github.com/zk3151463/ztools-plugin-cli
 echo    2. 添加仓库描述：ZTools 插件 CLI 工具 - 快速创建 ZTools 插件项目
 echo    3. 添加主题标签：ztools, cli, plugin, typescript
 echo    4. npm 包已发布在: https://www.npmjs.com/package/@ztools-center/plugin-cli

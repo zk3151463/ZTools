@@ -12,12 +12,12 @@ if [ ! -d "ztools-api-types" ]; then
 fi
 
 # 获取远程仓库地址（需要先在 GitHub 创建）
-REMOTE_URL="https://github.com/ZToolsCenter/ztools-api-types.git"
+REMOTE_URL="https://github.com/zk3151463/ztools-api-types.git"
 
 echo "📍 目标仓库: $REMOTE_URL"
 echo ""
 echo "⚠️  请确保："
-echo "   1. 已在 GitHub 创建私有仓库: ZToolsCenter/ztools-api-types"
+echo "   1. 已在 GitHub 创建私有仓库: zk3151463/ztools-api-types"
 echo "   2. 仓库设置为 Private"
 echo "   3. 没有初始化 README、.gitignore、license"
 echo ""
@@ -44,7 +44,7 @@ echo ""
 echo "✅ 发布完成！"
 echo ""
 echo "📝 下一步："
-echo "   1. 访问 https://github.com/ZToolsCenter/ztools-api-types"
+echo "   1. 访问 https://github.com/zk3151463/ztools-api-types"
 echo "   2. 确认仓库设置为 Private"
 echo "   3. 添加 README 和描述"
 echo "   4. （可选）发布到 npm: cd 到该仓库 && npm publish"

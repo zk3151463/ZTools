@@ -295,12 +295,19 @@ ztools/
 
 1. 先 fork 仓库
 
-- 如果需要贡献代码请 fork [ztools-api-types](https://github.com/ZToolsCenter/ztools-api-types) 和 [ztools-plugin-cli](https://github.com/ZToolsCenter/ztools-plugin-cli) 仓库
+- 如果需要贡献代码请 fork [ztools-api-types](https://github.com/zk3151463/ztools-api-types) 和 [ztools-plugin-cli](https://github.com/zk3151463/ztools-plugin-cli) 仓库
 
 2. 拉取完整代码
 
 ```bash
 git clone https://github.com/ZToolsCenter/ZTools.git --recurse-submodules
+```
+
+如果已经拉取了代码，但子模块未同步或需要更新最新的子模块地址，请在项目根目录执行以下命令：
+
+```bash
+git submodule sync
+git submodule update --init --recursive
 ```
 
 ### 开发命令

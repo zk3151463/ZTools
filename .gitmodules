@@ -1,6 +1,6 @@
 [submodule "ztools-plugin-cli"]
 	path = ztools-plugin-cli
-	url = https://github.com/ZToolsCenter/ztools-plugin-cli.git
+	url = https://github.com/zk3151463/ztools-plugin-cli.git
 [submodule "ztools-api-types"]
 	path = ztools-api-types
-	url = https://github.com/ZToolsCenter/ztools-api-types.git
+	url = https://github.com/zk3151463/ztools-api-types.git
