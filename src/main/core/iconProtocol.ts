@@ -1,8 +1,4 @@
-import { execSync } from 'child_process'
-import { app, protocol } from 'electron'
-import crypto from 'crypto'
-import fs from 'fs'
-import path from 'path'
+import { protocol } from 'electron'
 import { IconExtractor } from './native/index'
 
 /** 图标内存缓存（LRU 淘汰，Map 按插入顺序迭代） */
@@ -28,36 +24,33 @@ function setIconCache(key: string, buffer: Buffer): void {
 }
 
 /**
- * 根据平台提取图标并返回 PNG Buffer（同步）
+ * 根据平台提取图标并返回 PNG Buffer（异步，直接调用原生，无队列）
  */
-function extractIcon(iconPath: string): Buffer {
-  if (process.platform === 'darwin') {
-    const tempDir = path.join(app.getPath('temp'), 'ztools-icons')
-    fs.mkdirSync(tempDir, { recursive: true })
-
-    const hash = crypto.createHash('md5').update(iconPath).digest('hex')
-    const tempPngPath = path.join(tempDir, `${hash}.png`)
-
-    if (fs.existsSync(tempPngPath)) {
-      return fs.readFileSync(tempPngPath)
-    }
-
-    try {
-      execSync(
-        `sips -s format png '${iconPath}' --out '${tempPngPath}' --resampleHeightWidth 64 64 2>/dev/null`
-      )
-      return fs.readFileSync(tempPngPath)
-    } catch (error) {
-      console.error('[Main] sips 转换失败:', iconPath, error)
-      throw new Error('Icon conversion failed')
-    }
-  } else {
-    const iconBuffer = IconExtractor.getFileIcon(iconPath, 32)
-    if (!iconBuffer) {
-      throw new Error('Failed to extract icon')
-    }
-    return iconBuffer
+async function extractIcon(iconPath: string): Promise<Buffer> {
+  const iconBuffer = await IconExtractor.getFileIcon(iconPath)
+  if (!iconBuffer) {
+    throw new Error('Failed to extract icon')
   }
+  return iconBuffer
+}
+
+/**
+ * 串行图标提取队列
+ * macOS AppKit 图标 API 在高并发下可能返回 null，使用 promise 链确保每次只有一个提取任务在执行
+ */
+let extractionQueue: Promise<void> = Promise.resolve()
+
+/**
+ * 通过串行队列提取图标，确保原生调用不并发执行
+ */
+function extractIconQueued(iconPath: string): Promise<Buffer> {
+  const task = extractionQueue.then(() => extractIcon(iconPath))
+  // 更新队列尾部，忽略错误不阻塞后续任务
+  extractionQueue = task.then(
+    () => undefined,
+    () => undefined
+  )
+  return task
 }
 
 /**
@@ -95,10 +88,10 @@ export function registerIconScheme(): void {
 }
 
 /**
- * 获取文件图标的 base64 Data URL（同步）
+ * 获取文件图标的 base64 Data URL（异步）
  * 支持文件路径或文件扩展名（如 ".txt"）
  */
-export function getFileIconAsBase64(filePath: string): string {
+export async function getFileIconAsBase64(filePath: string): Promise<string> {
   // 命中内存缓存（刷新 LRU 顺序）
   const cached = iconMemoryCache.get(filePath)
   if (cached) {
@@ -106,7 +99,7 @@ export function getFileIconAsBase64(filePath: string): string {
     return `data:image/png;base64,${cached.toString('base64')}`
   }
 
-  const buffer = extractIcon(filePath)
+  const buffer = await extractIconQueued(filePath)
 
   // 写入内存缓存
   setIconCache(filePath, buffer)
@@ -123,7 +116,7 @@ export function registerIconProtocolForSession(targetSession: Electron.Session):
     return
   }
 
-  targetSession.protocol.handle('ztools-icon', (request) => {
+  targetSession.protocol.handle('ztools-icon', async (request) => {
     try {
       const urlPath = request.url.replace('ztools-icon://', '')
       const iconPath = decodeURIComponent(urlPath)
@@ -135,8 +128,8 @@ export function registerIconProtocolForSession(targetSession: Electron.Session):
         return createIconResponse(cached)
       }
 
-      // 未命中：提取图标
-      const buffer = extractIcon(iconPath)
+      // 未命中：通过串行队列提取图标
+      const buffer = await extractIconQueued(iconPath)
 
       // 写入内存缓存
       setIconCache(iconPath, buffer)

@@ -1,6 +1,6 @@
 {
   "name": "ZTools",
-  "version": "2.3.1",
+  "version": "2.4.1",
   "description": "ZTools",
   "main": "./out/main/index.js",
   "author": "lzx8589561",
@@ -34,6 +34,8 @@
     "build:mac:arm64": "pnpm build && electron-builder --mac --arm64",
     "build:mac:update": "pnpm build && electron-builder --mac --dir",
     "build:linux": "pnpm build && electron-builder --linux",
+    "build:linux:x64": "pnpm build && electron-builder --linux --x64",
+    "build:linux:arm64": "pnpm build && electron-builder --linux --arm64",
     "updater": "node scripts/updater.mjs",
     "test": "vitest run",
     "test:watch": "vitest",

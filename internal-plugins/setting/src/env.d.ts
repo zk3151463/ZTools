@@ -40,6 +40,11 @@ declare global {
             isDevelopment?: boolean
           }>
         >
+        getDisabledPlugins: () => Promise<string[]>
+        setPluginDisabled: (
+          pluginPath: string,
+          disabled: boolean
+        ) => Promise<{ success: boolean; error?: string }>
         getAllPlugins: () => Promise<
           Array<{
             name: string
@@ -73,10 +78,31 @@ declare global {
           error?: string
           plugin?: any
         }>
-        importDevPlugin: (pluginJsonPath?: string) => Promise<{ success: boolean; error?: string }>
+        // 获取当前记录的开发项目集合
+        getDevProjects: () => Promise<any[]>
+        // 导入开发中的插件工程，可选直接传入 plugin.json 路径
+        importDevPlugin: (pluginJsonPath?: string) => Promise<{
+          success: boolean
+          error?: string
+          pluginName?: string
+          pluginPath?: string
+        }>
+        // 从开发项目列表中移除指定项目，但保留磁盘目录
+        removeDevProject: (pluginName: string) => Promise<{ success: boolean; error?: string }>
+        // 将开发项目安装为开发模式插件
+        installDevPlugin: (pluginName: string) => Promise<{ success: boolean; error?: string }>
+        // 将开发项目从开发模式卸载
+        uninstallDevPlugin: (pluginName: string) => Promise<{ success: boolean; error?: string }>
+        // 校验当前设备绑定的开发项目配置
+        validateDevProject: (pluginName: string) => Promise<{ success: boolean; error?: string }>
+        // 为当前设备重新选择开发项目配置文件
+        selectDevProjectConfig: (
+          pluginName: string
+        ) => Promise<{ success: boolean; error?: string }>
+        // 打包指定开发项目
+        packageDevProject: (pluginName: string) => Promise<{ success: boolean; error?: string }>
         deletePlugin: (pluginPath: string) => Promise<{ success: boolean; error?: string }>
         killPlugin: (pluginPath: string) => Promise<{ success: boolean; error?: string }>
-        reloadPlugin: (pluginPath: string) => Promise<{ success: boolean; error?: string }>
         revealInFinder: (filePath: string) => Promise<void>
         launch: (options: {
           path: string
@@ -134,6 +160,7 @@ declare global {
           data?: Array<{
             pluginName: string
             pluginTitle: string | null
+            isDevelopment: boolean
             docCount: number
             attachmentCount: number
             logo: string | null
@@ -145,8 +172,10 @@ declare global {
           deletedCount?: number
           error?: string
         }>
-        packagePlugin: (pluginPath: string) => Promise<{
+        exportAllPlugins: () => Promise<{
           success: boolean
+          exportPath?: string
+          count?: number
           error?: string
         }>
         getPluginMemoryInfo: (pluginPath: string) => Promise<{
@@ -199,7 +228,9 @@ declare global {
         updateLocalAppSearch: (enabled: boolean) => Promise<void>
         updateRecentRows: (rows: number) => Promise<void>
         updatePinnedRows: (rows: number) => Promise<void>
+        updateClipboardConfig: (config: { retentionDays: number }) => Promise<void>
         updateSearchMode: (searchMode: 'aggregate' | 'list') => Promise<void>
+        updateTabKeyFunction: (mode: 'navigate' | 'target-command') => Promise<void>
         updateTabTarget: (target: string) => Promise<void>
         updateSpaceOpenCommand: (enabled: boolean) => Promise<void>
         updateFloatingBallDoubleClickCommand: (command: string) => Promise<void>
@@ -240,11 +271,16 @@ declare global {
         }>
 
         // 指令管理
+        // 返回设置页使用的原始指令快照，用于构建 alias 目标列表
         getCommands: () => Promise<{
           commands: any[]
           regexCommands: any[]
           plugins: any[]
         }>
+        // 保存 alias 映射。主进程会负责归一化、持久化，并触发主窗口的指令缓存刷新。
+        updateCommandAliases: (
+          aliases: Record<string, Array<{ alias: string; icon?: string }>>
+        ) => Promise<{ success: boolean }>
 
         // 本地启动管理
         localShortcuts: {
@@ -375,6 +411,11 @@ declare global {
           title?: string
           appPath?: string
         } | null>
+
+        // 唤醒黑名单
+        updateWakeupBlacklist: (
+          blacklist: Array<{ app: string; bundleId?: string; label?: string }>
+        ) => Promise<{ success: boolean }>
 
         // 超级面板翻译
         updateSuperPanelTranslate: (enabled: boolean) => Promise<{ success: boolean }>

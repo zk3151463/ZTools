@@ -62,6 +62,10 @@ export class SettingsAPI {
     try {
       const data = databaseAPI.dbGet('settings-general')
       console.log('[Settings] 加载到的设置:', data)
+      // 应用托盘图标显示设置（默认显示，在 if(data) 块外确保首次启动也能创建托盘）
+      windowManager.setTrayIconVisible(data?.showTrayIcon ?? true)
+      console.log('[Settings] 启动时应用托盘图标显示设置:', data?.showTrayIcon ?? true)
+
       if (data) {
         // 应用透明度设置
         if (data.opacity !== undefined && this.mainWindow) {
@@ -74,9 +78,6 @@ export class SettingsAPI {
           const success = updateShortcut(data.hotkey)
           console.log('[Settings] 启动时应用快捷键设置:', data.hotkey, success ? '成功' : '失败')
         }
-        // 应用托盘图标显示设置（默认显示）
-        windowManager.setTrayIconVisible(data.showTrayIcon ?? true)
-        console.log('[Settings] 启动时应用托盘图标显示设置:', data.showTrayIcon ?? true)
         // 应用主题设置
         if (data.theme) {
           this.setTheme(data.theme)
@@ -160,13 +161,13 @@ export class SettingsAPI {
   }
 
   // 设置主题
-  private setTheme(theme: string): void {
+  public setTheme(theme: string): void {
     nativeTheme.themeSource = theme as 'system' | 'light' | 'dark'
     console.log('[Settings] 设置主题:', theme)
   }
 
   // 设置开机启动
-  private setLaunchAtLogin(enable: boolean): void {
+  public setLaunchAtLogin(enable: boolean): void {
     app.setLoginItemSettings({
       openAtLogin: enable,
       openAsHidden: true
@@ -175,13 +176,13 @@ export class SettingsAPI {
   }
 
   // 获取开机启动状态
-  private getLaunchAtLogin(): boolean {
+  public getLaunchAtLogin(): boolean {
     const settings = app.getLoginItemSettings()
     return settings.openAtLogin
   }
 
   // 更新快捷键
-  private updateShortcut(shortcut: string): { success: boolean; error?: string } {
+  public updateShortcut(shortcut: string): { success: boolean; error?: string } {
     try {
       const success = updateShortcut(shortcut)
       if (success) {
@@ -216,7 +217,7 @@ export class SettingsAPI {
   }
 
   // 注册全局快捷键
-  private registerGlobalShortcut(shortcut: string, target: string): any {
+  public registerGlobalShortcut(shortcut: string, target: string): any {
     try {
       if (this.isDoubleTapShortcut(shortcut)) {
         const modifier = this.getDoubleTapModifier(shortcut)
@@ -250,7 +251,7 @@ export class SettingsAPI {
   }
 
   // 注销全局快捷键
-  private unregisterGlobalShortcut(shortcut: string): any {
+  public unregisterGlobalShortcut(shortcut: string): any {
     try {
       if (this.isDoubleTapShortcut(shortcut)) {
         const modifier = this.getDoubleTapModifier(shortcut)
@@ -285,7 +286,7 @@ export class SettingsAPI {
   }
 
   // 开始快捷键录制（注册临时快捷键监听）
-  private startHotkeyRecording(): { success: boolean; error?: string } {
+  public startHotkeyRecording(): { success: boolean; error?: string } {
     try {
       // 如果已经在录制，先注销之前的临时快捷键
       if (this.recordingShortcuts.length > 0) {
@@ -383,13 +384,12 @@ export class SettingsAPI {
   }
 
   // 注册应用快捷键
-  private registerAppShortcut(shortcut: string, target: string): any {
+  public registerAppShortcut(shortcut: string, target: string): any {
     try {
       const success = windowManager.registerAppShortcut(shortcut, target)
       if (!success) {
         return { success: false, error: '应用快捷键注册失败' }
       }
-      console.log(`成功注册应用快捷键: ${shortcut} -> ${target}`)
       return { success: true }
     } catch (error: unknown) {
       console.error('[Settings] 注册应用快捷键失败:', error)
@@ -398,7 +398,7 @@ export class SettingsAPI {
   }
 
   // 注销应用快捷键
-  private unregisterAppShortcut(shortcut: string): any {
+  public unregisterAppShortcut(shortcut: string): any {
     try {
       windowManager.unregisterAppShortcut(shortcut)
       console.log(`成功注销应用快捷键: ${shortcut}`)

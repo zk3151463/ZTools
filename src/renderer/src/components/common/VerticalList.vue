@@ -10,18 +10,17 @@
     >
       <div class="item-icon">
         <img v-if="app.icon" :src="app.icon" alt="" draggable="false" />
+        <span
+          v-if="app.pluginName && isDevelopmentPluginName(app.pluginName)"
+          class="item-dev-badge"
+          >DEV</span
+        >
       </div>
       <div class="item-content">
         <!-- eslint-disable-next-line vue/no-v-html -->
         <div class="item-title" v-html="getHighlightedName(app)"></div>
-        <div v-if="app.pluginExplain" class="item-subtitle">
-          {{ app.pluginExplain }}
-        </div>
-        <div
-          v-else-if="app.type === 'direct' && app.subType === 'app' && app.path"
-          class="item-subtitle"
-        >
-          {{ app.path }}
+        <div v-if="getSubtitle(app)" class="item-subtitle">
+          {{ getSubtitle(app) }}
         </div>
       </div>
       <div v-if="app.type === 'plugin'" class="item-badge">
@@ -34,6 +33,7 @@
 <script setup lang="ts">
 import type { Command } from '../../stores/commandDataStore'
 import { highlightMatch } from '../../utils/highlight'
+import { isDevelopmentPluginName } from '../../../../shared/pluginRuntimeNamespace'
 
 interface Props {
   apps: Command[]
@@ -53,6 +53,18 @@ defineEmits<{
 
 function getHighlightedName(app: Command): string {
   return highlightMatch(app.name, app.matches, app.matchType, props.searchQuery)
+}
+
+function getSubtitle(app: Command): string {
+  if (app.pluginExplain) {
+    return app.pluginExplain
+  }
+
+  if (app.type === 'direct' && app.subType !== 'system-setting' && app.path) {
+    return app.path
+  }
+
+  return ''
 }
 </script>
 
@@ -83,6 +95,7 @@ function getHighlightedName(app: Command): string {
 }
 
 .item-icon {
+  position: relative;
   flex-shrink: 0;
   width: 32px;
   height: 32px;
@@ -95,6 +108,24 @@ function getHighlightedName(app: Command): string {
   width: 100%;
   height: 100%;
   object-fit: contain;
+}
+
+.item-dev-badge {
+  position: absolute;
+  right: -5px;
+  bottom: -5px;
+  display: inline-flex;
+  min-width: 18px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--bg-color);
+  border-radius: 999px;
+  background: var(--highlight-color);
+  color: var(--text-on-primary);
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 2px 4px;
 }
 
 .item-content {

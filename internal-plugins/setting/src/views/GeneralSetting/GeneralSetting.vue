@@ -75,6 +75,11 @@ const searchModeOptions = [
   { label: '列表模式', value: 'list' }
 ]
 
+const tabKeyFunctionOptions = [
+  { label: '切换选中', value: 'navigate' },
+  { label: '目标指令', value: 'target-command' }
+]
+
 const devToolsModeOptions = [
   { label: '独立窗口', value: 'detach' },
   { label: '靠右', value: 'right' },
@@ -130,9 +135,11 @@ const localAppSearch = ref(true)
 const recentRows = ref(2)
 const pinnedRows = ref(2)
 const searchMode = ref<'aggregate' | 'list'>('aggregate')
+const clipboardRetentionDays = ref(180)
 
 // Tab 键目标指令
 const tabTargetCommand = ref('')
+const tabKeyFunction = ref<'navigate' | 'target-command'>('navigate')
 
 // 空格打开指令
 const spaceOpenCommand = ref(false)
@@ -145,6 +152,9 @@ const superPanelEnabled = ref(false)
 const superPanelMouseButton = ref<MouseButtonType>('middle')
 const superPanelLongPressMs = ref(500)
 const superPanelBlockedApps = ref<Array<{ app: string; bundleId?: string; label?: string }>>([])
+
+// 唤醒黑名单
+const wakeupBlacklist = ref<Array<{ app: string; bundleId?: string; label?: string }>>([])
 
 // 超级面板翻译设置
 const superPanelTranslateEnabled = ref(false)
@@ -190,6 +200,9 @@ const launchAtLogin = ref(false)
 
 // 开发者工具位置
 const devToolsMode = ref<'right' | 'bottom' | 'undocked' | 'detach'>('detach')
+
+// 关闭 GPU 加速（兜底方案，修改后需重启生效）
+const disableGpuAcceleration = ref(false)
 
 // 代理设置
 const proxyEnabled = ref(false)
@@ -326,7 +339,7 @@ async function handleWindowDefaultHeightChange(): Promise<void> {
       windowDefaultHeight.value = 541
     }
     await saveSettings()
-    // 通知主进程更新窗口默认高度
+    // 通知主进程更新
     await window.ztools.internal.setWindowDefaultHeight(windowDefaultHeight.value)
     console.log('插件默认高度已更新:', windowDefaultHeight.value)
   } catch (error) {
@@ -343,6 +356,33 @@ async function resetWindowDefaultHeight(): Promise<void> {
     console.log('插件默认高度已重置')
   } catch (error) {
     console.error('重置插件默认高度失败:', error)
+  }
+}
+
+// 处理剪贴板历史保存天数变化
+async function handleClipboardRetentionDaysChange(): Promise<void> {
+  try {
+    if (!clipboardRetentionDays.value || clipboardRetentionDays.value < 1) {
+      clipboardRetentionDays.value = 180
+    }
+    await saveSettings()
+    // 通知主进程更新剪贴板配置
+    await window.ztools.internal.updateClipboardConfig({
+      retentionDays: clipboardRetentionDays.value
+    })
+    console.log('剪贴板历史保存天数已更新:', clipboardRetentionDays.value)
+  } catch (error) {
+    console.error('保存剪贴板历史保存天数失败:', error)
+  }
+}
+
+// 重置剪贴板历史保存天数
+async function resetClipboardRetentionDays(): Promise<void> {
+  try {
+    clipboardRetentionDays.value = 180
+    await handleClipboardRetentionDaysChange()
+  } catch (error) {
+    console.error('重置剪贴板历史保存天数失败:', error)
   }
 }
 
@@ -547,6 +587,17 @@ async function handleTabTargetChange(): Promise<void> {
     console.log('Tab 键目标指令已更新:', tabTargetCommand.value)
   } catch (error) {
     console.error('保存 Tab 键目标指令失败:', error)
+  }
+}
+
+// 处理 Tab 键功能变化
+async function handleTabKeyFunctionChange(): Promise<void> {
+  try {
+    await saveSettings()
+    await window.ztools.internal.updateTabKeyFunction(tabKeyFunction.value)
+    console.log('Tab 键功能已更新:', tabKeyFunction.value)
+  } catch (error) {
+    console.error('保存 Tab 键功能失败:', error)
   }
 }
 
@@ -764,6 +815,56 @@ async function handleRemoveBlockedApp(index: number): Promise<void> {
   }
 }
 
+// 添加到唤醒黑名单
+async function handleAddWakeupBlacklistApp(): Promise<void> {
+  try {
+    const windowInfo = await window.ztools.internal.getCurrentWindowInfo()
+    if (!windowInfo) {
+      error('无法获取当前窗口信息')
+      return
+    }
+
+    const isDuplicate =
+      platform.value === 'darwin' && windowInfo.bundleId
+        ? wakeupBlacklist.value.some((item) => item.bundleId === windowInfo.bundleId)
+        : wakeupBlacklist.value.some(
+            (item) => item.app.toLowerCase() === windowInfo.app.toLowerCase()
+          )
+
+    if (isDuplicate) {
+      info('该应用已在唤醒黑名单中')
+      return
+    }
+
+    const label = windowInfo.app.replace(/\.(exe|app)$/i, '')
+    wakeupBlacklist.value.push({
+      app: windowInfo.app,
+      bundleId: windowInfo.bundleId,
+      label
+    })
+
+    await saveSettings()
+    await window.ztools.internal.updateWakeupBlacklist(
+      wakeupBlacklist.value.map((item) => ({ ...item }))
+    )
+  } catch (err) {
+    console.error('添加唤醒黑名单失败:', err)
+  }
+}
+
+// 移除唤醒黑名单应用
+async function handleRemoveWakeupBlacklistApp(index: number): Promise<void> {
+  try {
+    wakeupBlacklist.value.splice(index, 1)
+    await saveSettings()
+    await window.ztools.internal.updateWakeupBlacklist(
+      wakeupBlacklist.value.map((item) => ({ ...item }))
+    )
+  } catch (err) {
+    console.error('移除唤醒黑名单失败:', err)
+  }
+}
+
 // 处理主题色变化
 async function handlePrimaryColorChange(color: string): Promise<void> {
   try {
@@ -921,6 +1022,17 @@ async function handleDevToolsModeChange(): Promise<void> {
   }
 }
 
+// 处理关闭 GPU 加速开关变化
+async function handleDisableGpuAccelerationChange(): Promise<void> {
+  try {
+    await saveSettings()
+    info('设置已保存，重启应用后生效')
+    console.log('关闭 GPU 加速设置已更新:', disableGpuAcceleration.value)
+  } catch (err) {
+    console.error('保存关闭 GPU 加速设置失败:', err)
+  }
+}
+
 // 处理代理开关变化
 async function handleProxyEnabledChange(): Promise<void> {
   try {
@@ -1042,6 +1154,8 @@ async function loadSettings(): Promise<void> {
       primaryColor.value = data.primaryColor ?? 'blue'
       searchMode.value = data.searchMode ?? 'aggregate'
       autoCheckUpdate.value = data.autoCheckUpdate ?? true
+      tabKeyFunction.value =
+        data.tabKeyFunction ?? (data.tabTargetCommand ? 'target-command' : 'navigate')
       // Tab 键目标指令
       tabTargetCommand.value = data.tabTargetCommand ?? ''
       // 空格打开指令
@@ -1054,6 +1168,7 @@ async function loadSettings(): Promise<void> {
       superPanelMouseButton.value = data.superPanelMouseButton ?? 'middle'
       superPanelLongPressMs.value = data.superPanelLongPressMs ?? 500
       superPanelBlockedApps.value = data.superPanelBlockedApps ?? []
+      wakeupBlacklist.value = data.wakeupBlacklist ?? []
       superPanelTranslateEnabled.value = data.superPanelTranslateEnabled ?? false
       if (superPanelTranslateEnabled.value) {
         pollTranslationStatus()
@@ -1064,6 +1179,8 @@ async function loadSettings(): Promise<void> {
       acrylicDarkOpacity.value = data.acrylicDarkOpacity ?? 50
       // 开发者工具位置
       devToolsMode.value = data.devToolsMode ?? 'detach'
+      // GPU 加速控制
+      disableGpuAcceleration.value = data.disableGpuAcceleration ?? false
 
       // 代理配置
       proxyEnabled.value = data.proxyEnabled ?? false
@@ -1105,7 +1222,11 @@ async function saveSettings(): Promise<void> {
     // 只有自定义头像才保存到数据库，默认头像不保存
     const avatarToSave = avatar.value === defaultAvatar ? undefined : avatar.value
 
+    // 先读取现有设置，保留本页不管理的字段（如 builtinAppShortcutsEnabled）
+    const existing = (await window.ztools.internal.dbGet('settings-general')) || {}
+
     await window.ztools.internal.dbPut('settings-general', {
+      ...existing,
       opacity: opacity.value,
       windowDefaultHeight: windowDefaultHeight.value,
       hotkey: hotkey.value,
@@ -1120,6 +1241,7 @@ async function saveSettings(): Promise<void> {
       recentRows: recentRows.value,
       pinnedRows: pinnedRows.value,
       searchMode: searchMode.value,
+      tabKeyFunction: tabKeyFunction.value,
       tabTargetCommand: tabTargetCommand.value,
       spaceOpenCommand: spaceOpenCommand.value,
       floatingBallDoubleClickCommand: floatingBallDoubleClickCommand.value,
@@ -1129,6 +1251,7 @@ async function saveSettings(): Promise<void> {
       superPanelMouseButton: superPanelMouseButton.value,
       superPanelLongPressMs: superPanelLongPressMs.value,
       superPanelBlockedApps: superPanelBlockedApps.value.map((item) => ({ ...item })),
+      wakeupBlacklist: wakeupBlacklist.value.map((item) => ({ ...item })),
       superPanelTranslateEnabled: superPanelTranslateEnabled.value,
       theme: theme.value,
       primaryColor: primaryColor.value,
@@ -1138,11 +1261,13 @@ async function saveSettings(): Promise<void> {
       acrylicLightOpacity: acrylicLightOpacity.value,
       acrylicDarkOpacity: acrylicDarkOpacity.value,
       devToolsMode: devToolsMode.value,
+      disableGpuAcceleration: disableGpuAcceleration.value,
       proxyEnabled: proxyEnabled.value,
       proxyUrl: proxyUrl.value,
       pluginMarketCustom: pluginMarketCustom.value,
       pluginMarketUrl: pluginMarketUrl.value,
-      autoCheckUpdate: autoCheckUpdate.value
+      autoCheckUpdate: autoCheckUpdate.value,
+      clipboardRetentionDays: clipboardRetentionDays.value
     })
   } catch (error) {
     console.error('保存设置失败:', error)
@@ -1240,6 +1365,28 @@ onUnmounted(() => {
             <input v-model="showTrayIcon" type="checkbox" @change="handleTrayIconChange" />
             <span class="toggle-slider"></span>
           </label>
+        </div>
+      </div>
+
+      <div class="setting-item blocked-apps-setting">
+        <div class="blocked-apps-content">
+          <div class="blocked-apps-header">
+            <div class="setting-label">
+              <span>唤醒黑名单</span>
+              <span class="setting-desc">在指定应用窗口中按快捷键不唤醒主窗口</span>
+            </div>
+            <div class="setting-control">
+              <button class="btn btn-sm" @click="handleAddWakeupBlacklistApp">添加当前窗口</button>
+            </div>
+          </div>
+          <div v-if="wakeupBlacklist.length > 0" class="blocked-apps-tags">
+            <span v-for="(app, index) in wakeupBlacklist" :key="app.app" class="blocked-app-tag">
+              {{ app.label || app.app }}
+              <button class="blocked-app-remove" @click="handleRemoveWakeupBlacklistApp(index)">
+                &times;
+              </button>
+            </span>
+          </div>
         </div>
       </div>
     </div>
@@ -1551,6 +1698,22 @@ onUnmounted(() => {
 
       <div class="setting-item tab-target-setting-item">
         <div class="setting-label">
+          <span>Tab 功能</span>
+          <span class="setting-desc">设置 Tab 键用于切换选中项，或直接进入指定指令</span>
+        </div>
+        <div class="setting-control-column">
+          <div class="setting-control">
+            <Dropdown
+              v-model="tabKeyFunction"
+              :options="tabKeyFunctionOptions"
+              @change="handleTabKeyFunctionChange"
+            />
+          </div>
+        </div>
+      </div>
+
+      <div v-if="tabKeyFunction === 'target-command'" class="setting-item tab-target-setting-item">
+        <div class="setting-label">
           <span>Tab 键目标指令</span>
           <span class="setting-desc"
             >配置后在搜索框输入文字按 Tab 键可直接进入对应指令，常用于快速打开 AI 对话等场景</span
@@ -1667,6 +1830,47 @@ onUnmounted(() => {
             class="btn btn-icon"
             title="重置"
             @click="resetWindowDefaultHeight"
+          >
+            <svg
+              width="20"
+              height="20"
+              viewBox="1 0 18 18"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <path
+                d="M14.5 9C14.5 11.4853 12.4853 13.5 10 13.5C7.51472 13.5 5.5 11.4853 5.5 9C5.5 6.51472 7.51472 4.5 10 4.5C11.6569 4.5 13.0943 5.41421 13.8536 6.75M14 4V7H11"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="setting-item">
+        <div class="setting-label">
+          <span>剪贴板历史保存天数</span>
+          <span class="setting-desc">剪贴板历史记录的保留时长（天）</span>
+        </div>
+        <div class="setting-control">
+          <input
+            v-model.number="clipboardRetentionDays"
+            type="number"
+            class="input"
+            placeholder="180"
+            min="1"
+            max="3650"
+            @blur="handleClipboardRetentionDaysChange"
+            @keyup.enter="handleClipboardRetentionDaysChange"
+          />
+          <button
+            v-if="clipboardRetentionDays !== 180"
+            class="btn btn-icon"
+            title="重置"
+            @click="resetClipboardRetentionDays"
           >
             <svg
               width="20"
@@ -1990,6 +2194,25 @@ onUnmounted(() => {
           />
         </div>
       </div>
+
+      <div class="setting-item">
+        <div class="setting-label">
+          <span>关闭 GPU 加速</span>
+          <span class="setting-desc"
+            >禁用硬件加速渲染，可解决白屏、渲染异常等 GPU 兼容性问题，修改后需重启应用生效</span
+          >
+        </div>
+        <div class="setting-control">
+          <label class="toggle">
+            <input
+              v-model="disableGpuAcceleration"
+              type="checkbox"
+              @change="handleDisableGpuAccelerationChange"
+            />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -2040,13 +2263,13 @@ onUnmounted(() => {
 }
 
 .setting-label > span:first-child {
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 500;
   color: var(--text-color);
 }
 
 .setting-desc {
-  font-size: 13px;
+  font-size: 12px;
   color: var(--text-secondary);
 }
 

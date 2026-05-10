@@ -8,6 +8,9 @@ import { GLOBAL_SCROLLBAR_CSS } from './globalStyles.js'
 import lmdbInstance from './lmdb/lmdbInstance'
 import devToolsShortcut, { getDevToolsMode } from '../utils/devToolsShortcut'
 import { WINDOW_WIDTH } from '../common/constants'
+import { registerExternalLinkInterceptor } from '../managers/pluginManager'
+import pluginWindowManager from './pluginWindowManager'
+import { getDetachedWindowSizeKey } from '../../shared/pluginRuntimeNamespace'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -62,8 +65,9 @@ class DetachedWindowManager {
     try {
       const normalizedWidth = Math.max(MIN_WINDOW_WIDTH, Math.round(width))
       const normalizedHeight = Math.max(MIN_VIEW_HEIGHT, Math.round(viewHeight))
+      const sizeKey = getDetachedWindowSizeKey(pluginName)
 
-      const lastSaved = this.lastSavedSizeByPlugin.get(pluginName)
+      const lastSaved = this.lastSavedSizeByPlugin.get(sizeKey)
       if (
         lastSaved &&
         lastSaved.width === normalizedWidth &&
@@ -75,14 +79,14 @@ class DetachedWindowManager {
       const existing = databaseAPI.dbGet('detachedWindowSizes') || {}
       const next = {
         ...(typeof existing === 'object' && existing !== null ? existing : {}),
-        [pluginName]: {
+        [sizeKey]: {
           width: normalizedWidth,
           height: normalizedHeight
         }
       }
 
       databaseAPI.dbPut('detachedWindowSizes', next)
-      this.lastSavedSizeByPlugin.set(pluginName, {
+      this.lastSavedSizeByPlugin.set(sizeKey, {
         width: normalizedWidth,
         height: normalizedHeight
       })
@@ -169,13 +173,25 @@ class DetachedWindowManager {
       // Windows 系统配置（与主窗口保持一致）
       else if (isWindows) {
         windowConfig.backgroundColor = '#00000000' // 完全透明，让 Mica 材质显示
+        // 设置插件窗口独立图标
+        if (options.logo) {
+          try {
+            windowConfig.icon = options.logo.startsWith('file:')
+              ? fileURLToPath(options.logo)
+              : options.logo
+          } catch (error) {
+            console.warn('[DetachedWindow] 设置窗口图标失败:', error)
+          }
+        }
       }
-
       const win = new BrowserWindow(windowConfig)
-
       // Windows 11 应用窗口材质（与主窗口保持一致）
       if (isWindows) {
         this.applyWindowMaterial(win)
+        // 设置插件窗口ID，避免任务栏窗口合并
+        win.setAppDetails({
+          appId: 'ZTools.' + pluginName
+        })
       }
 
       // 窗口直接加载标题栏 HTML
@@ -188,9 +204,13 @@ class DetachedWindowManager {
 
       // 标题栏加载完成后发送插件信息，并添加插件视图
       win.webContents.on('did-finish-load', () => {
-        console.log('[DetachedWindow] 标题栏加载完成，发送插件信息', pluginName, options)
+        console.log('[DetachedWindow] 标题栏加载完成，发送插件信息', {
+          pluginName,
+          options
+        })
         win.webContents.send('init-titlebar', {
           pluginName,
+          pluginPath,
           pluginLogo: options.logo,
           platform: process.platform,
           title: options.title, // 窗口标题
@@ -271,6 +291,8 @@ class DetachedWindowManager {
           clearTimeout(timer)
           this.resizeSaveTimers.delete(windowId)
         }
+        // 关闭该插件通过 createBrowserWindow 创建的所有独立窗口
+        pluginWindowManager.closeByPlugin(pluginPath)
         // 销毁插件视图的 webContents
         if (!pluginView.webContents.isDestroyed()) {
           pluginView.webContents.close()
@@ -301,6 +323,9 @@ class DetachedWindowManager {
       pluginView.webContents.on('blur', () => {
         devToolsShortcut.unregister()
       })
+
+      // 拦截外部链接跳转，使用系统默认浏览器打开
+      registerExternalLinkInterceptor(pluginView.webContents)
 
       // 窗口失焦时快照焦点状态（此时 lastFocusTarget 还是正确的）
       win.on('blur', () => {
@@ -632,7 +657,12 @@ class DetachedWindowManager {
     for (const [windowId, info] of this.detachedWindowMap.entries()) {
       try {
         if (!info.window.isDestroyed()) {
+          // 向标题栏页面发送
           info.window.webContents.send(channel, ...args)
+        }
+        if (!info.view.webContents.isDestroyed()) {
+          // 向插件内容页面发送
+          info.view.webContents.send(channel, ...args)
         }
       } catch (error) {
         console.error(`[DetachedWindow] 广播消息到分离窗口 ${windowId} 失败:`, error)

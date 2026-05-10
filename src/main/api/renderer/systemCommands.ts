@@ -1,8 +1,9 @@
-import { exec } from 'child_process'
+import { exec, spawn } from 'child_process'
 import type { PluginManager } from '../../managers/pluginManager'
-import { BrowserWindow, clipboard, Notification, shell } from 'electron'
+import { BrowserWindow, clipboard, nativeImage, Notification, shell } from 'electron'
 import { promisify } from 'util'
 import { GLOBAL_SCROLLBAR_CSS } from '../../core/globalStyles'
+import { screenCapture } from '../../core/screenCapture'
 import windowManager from '../../managers/windowManager'
 import webSearchAPI from './webSearch'
 import databaseAPI from '../shared/database'
@@ -39,6 +40,8 @@ export async function executeSystemCommand(
         cmd = 'osascript -e "tell application \\"System Events\\" to restart"'
       } else if (platform === 'win32') {
         cmd = 'shutdown /r /t 0'
+      } else if (platform === 'linux') {
+        cmd = 'systemctl reboot'
       }
       break
 
@@ -47,6 +50,19 @@ export async function executeSystemCommand(
         cmd = 'osascript -e "tell application \\"System Events\\" to shut down"'
       } else if (platform === 'win32') {
         cmd = 'shutdown /s /t 0'
+      } else if (platform === 'linux') {
+        cmd = 'systemctl poweroff'
+      }
+      break
+
+    case 'logoff':
+      if (platform === 'darwin') {
+        cmd = 'osascript -e "tell application \\"System Events\\" to log out"'
+      } else if (platform === 'win32') {
+        cmd = 'shutdown /l'
+      } else if (platform === 'linux') {
+        cmd =
+          'gnome-session-quit --logout --no-prompt || xfce4-session-logout --logout || qdbus org.kde.ksmserver /KSMServer logout 0 0 0 || loginctl terminate-user $USER'
       }
       break
 
@@ -54,7 +70,10 @@ export async function executeSystemCommand(
       if (platform === 'darwin') {
         cmd = 'osascript -e "tell application \\"System Events\\" to sleep"'
       } else if (platform === 'win32') {
-        cmd = 'rundll32.exe powrprof.dll,SetSuspendState 0,1,0'
+        ctx.mainWindow?.hide()
+        cmd = `powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Application]::SetSuspendState('Suspend', $false, $false)"`
+      } else if (platform === 'linux') {
+        cmd = 'systemctl suspend'
       }
       break
 
@@ -65,6 +84,8 @@ export async function executeSystemCommand(
           'osascript -e "tell application \\"System Events\\" to keystroke \\"q\\" using {control down, command down}"'
       } else if (platform === 'win32') {
         cmd = 'rundll32.exe user32.dll,LockWorkStation'
+      } else if (platform === 'linux') {
+        cmd = 'xdg-screensaver lock || gnome-screensaver-command -l'
       }
       break
 
@@ -79,6 +100,9 @@ export async function executeSystemCommand(
     case 'open-url':
       return handleOpenUrl(ctx, param)
 
+    case 'open-folder':
+      return handleOpenFolder(ctx, param)
+
     case 'window-info':
       return handleWindowInfo(ctx)
 
@@ -90,6 +114,12 @@ export async function executeSystemCommand(
 
     case 'color-picker':
       return handleColorPicker(ctx)
+
+    case 'screenshot':
+      return handleScreenshot(ctx)
+
+    case 'add-to-wakeup-blacklist':
+      return handleAddToWakeupBlacklist(ctx)
 
     default:
       // 处理网页快开搜索引擎 (web-search-{id})
@@ -179,6 +209,29 @@ async function handleDynamicWebSearch(
     return { success: false, error: '未找到搜索引擎配置' }
   }
   return handleWebSearch(ctx, param, engine.url, engine.name)
+}
+
+async function handleScreenshot(ctx: SystemCommandContext): Promise<any> {
+  console.log('[SystemCmd] 执行截图')
+
+  try {
+    const result = await screenCapture(ctx.mainWindow || undefined, false)
+    if (!result.image) {
+      return { success: false, error: '未获取到截图内容' }
+    }
+
+    clipboard.writeImage(nativeImage.createFromDataURL(result.image))
+
+    new Notification({
+      title: 'ZTools',
+      body: '截图已复制到剪贴板'
+    }).show()
+
+    return { success: true }
+  } catch (error) {
+    console.error('[SystemCmd] 截图失败:', error)
+    return { success: false, error: String(error) }
+  }
 }
 
 async function handleOpenUrl(ctx: SystemCommandContext, param: any): Promise<any> {
@@ -394,8 +447,89 @@ async function handleOpenTerminal(
       console.error('[SystemCmd] 在终端打开失败:', error)
       return { success: false, error: String(error) }
     }
+  } else if (process.platform === 'linux') {
+    try {
+      // 获取当前用户主目录作为默认路径
+      const folderPath = require('os').homedir()
+
+      // 依次尝试常用的终端启动方式，由于 spawn 不会像 exec 那样容易受到注入攻击
+      // 我们通过尝试启动不同的进程来实现兼容性
+      const tryLaunch = (cmd: string, args: string[]) => {
+        return new Promise<boolean>((resolve) => {
+          const child = spawn(cmd, args, { detached: true, stdio: 'ignore' })
+          child.on('error', () => resolve(false))
+          // 只要进程成功启动（没有立即触发 error 且 pid 存在），就认为成功
+          if (child.pid) {
+            child.unref()
+            resolve(true)
+          }
+        })
+      }
+
+      const launched =
+        (await tryLaunch('exo-open', [
+          '--launch',
+          'TerminalEmulator',
+          '--working-directory',
+          folderPath
+        ])) ||
+        (await tryLaunch('gnome-terminal', [`--working-directory=${folderPath}`])) ||
+        (await tryLaunch('xterm', ['-cd', folderPath]))
+
+      if (!launched) {
+        throw new Error('Could not find a supported terminal emulator')
+      }
+
+      console.log('[SystemCmd] 已在终端打开')
+      ctx.mainWindow?.hide()
+      return { success: true }
+    } catch (error) {
+      console.error('[SystemCmd] 在终端打开失败:', error)
+      return { success: false, error: String(error) }
+    }
   }
   return { success: false, error: `不支持的平台: ${process.platform}` }
+}
+
+async function handleOpenFolder(ctx: SystemCommandContext, param: any): Promise<any> {
+  console.log('[SystemCmd] 前往文件夹:', param)
+  if (!param?.payload) {
+    return { success: false, error: '缺少路径' }
+  }
+
+  let targetPath: string = param.payload.trim()
+
+  // 展开 ~ 为用户主目录
+  if (targetPath.startsWith('~')) {
+    const os = await import('os')
+    targetPath = os.homedir() + targetPath.slice(1)
+  }
+
+  const fs = await import('fs')
+  let stat: import('fs').Stats | null = null
+  try {
+    stat = fs.statSync(targetPath)
+  } catch {
+    // 路径不存在，仍尝试 openPath（让系统报错）
+  }
+
+  if (stat && stat.isFile()) {
+    // 是文件：在 Finder/Explorer 中高亮显示文件
+    shell.showItemInFolder(targetPath)
+    ctx.mainWindow?.webContents.send('app-launched')
+    ctx.mainWindow?.hide()
+    return { success: true }
+  }
+
+  const errorMessage = await shell.openPath(targetPath)
+  if (errorMessage) {
+    console.error('[SystemCmd] 前往文件夹失败:', errorMessage)
+    return { success: false, error: errorMessage }
+  }
+
+  ctx.mainWindow?.webContents.send('app-launched')
+  ctx.mainWindow?.hide()
+  return { success: true }
 }
 
 function handleColorPicker(ctx: SystemCommandContext): Promise<any> {
@@ -422,4 +556,51 @@ function handleColorPicker(ctx: SystemCommandContext): Promise<any> {
       resolve({ success: false, error: String(error) })
     }
   })
+}
+
+/**
+ * 添加到唤醒黑名单：将唤醒前活动窗口的应用加入黑名单
+ */
+function handleAddToWakeupBlacklist(ctx: SystemCommandContext): any {
+  const winInfo = windowManager.getPreviousActiveWindow()
+  if (!winInfo?.app) {
+    return { success: false, error: '无法获取当前窗口信息' }
+  }
+
+  const settings = databaseAPI.dbGet('settings-general') || {}
+  const blacklist: Array<{ app: string; bundleId?: string; label?: string }> =
+    settings.wakeupBlacklist ?? []
+
+  // 去重：macOS 按 bundleId，Windows 按 app 名称
+  const isDuplicate =
+    process.platform === 'darwin' && winInfo.bundleId
+      ? blacklist.some((item) => item.bundleId === winInfo.bundleId)
+      : blacklist.some((item) => item.app.toLowerCase() === winInfo.app.toLowerCase())
+
+  if (isDuplicate) {
+    ctx.mainWindow?.hide()
+    if (Notification.isSupported()) {
+      new Notification({ title: 'ZTools', body: `${winInfo.app} 已在唤醒黑名单中` }).show()
+    }
+    return { success: false, error: '该应用已在唤醒黑名单中' }
+  }
+
+  const label = winInfo.app.replace(/\.(exe|app)$/i, '')
+  blacklist.push({
+    app: winInfo.app,
+    bundleId: winInfo.bundleId,
+    label
+  })
+
+  databaseAPI.dbPut('settings-general', { ...settings, wakeupBlacklist: blacklist })
+  windowManager.updateWakeupBlacklist(blacklist)
+
+  ctx.mainWindow?.hide()
+  if (Notification.isSupported()) {
+    new Notification({
+      title: 'ZTools',
+      body: `已将 ${label} 添加到唤醒黑名单`
+    }).show()
+  }
+  return { success: true }
 }

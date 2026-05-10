@@ -1,11 +1,22 @@
 import os from 'os'
+import { execSync, spawnSync } from 'child_process'
+import { clipboard } from 'electron'
 import macZToolsNative from '../../../../resources/lib/mac/ztools_native.node?asset'
 import winZToolsNative from '../../../../resources/lib/win/ztools_native.node?asset'
 
 // 根据平台加载对应的原生模块
+// 注意：?asset 导入是 Vite 构建期转换，只能做静态导入（得到路径字符串）
+// 真正的模块加载在下方 require() 中，按平台各自加载，Linux 不加载任何原生模块
 const platform = os.platform()
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const addon = require(platform === 'darwin' ? macZToolsNative : winZToolsNative)
+
+let addon: any = null
+if (platform === 'darwin') {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  addon = require(macZToolsNative)
+} else if (platform === 'win32') {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  addon = require(winZToolsNative)
+}
 
 // 原生模块接口类型定义
 interface UwpAppInfo {
@@ -41,7 +52,7 @@ interface NativeAddon {
   stopMouseMonitor: () => void
   getUwpApps: () => UwpAppInfo[]
   launchUwpApp: (appId: string) => boolean
-  getFileIcon: (filePath: string, size: number) => Buffer | null
+  getFileIcon: (filePath: string) => Promise<Buffer>
   resolveMuiStrings: (refs: string[]) => { [ref: string]: string }
   startColorPicker: (callback: (result: { success: boolean; hex: string | null }) => void) => void
   stopColorPicker: () => void
@@ -93,6 +104,7 @@ type MouseButtonType = 'middle' | 'right' | 'back' | 'forward'
 export class ClipboardMonitor {
   private _callback: (() => void) | null = null
   private _isMonitoring = false
+  private _pollTimer: ReturnType<typeof setInterval> | null = null
 
   /**
    * 启动剪贴板监控
@@ -109,11 +121,26 @@ export class ClipboardMonitor {
 
     this._callback = callback
     this._isMonitoring = true
-    ;(addon as NativeAddon).startMonitor(() => {
-      if (this._callback) {
-        this._callback()
-      }
-    })
+
+    if (platform === 'linux') {
+      // Linux 降级：使用 Electron clipboard 轮询（每 500ms 检测一次变化）
+      let lastText = clipboard.readText()
+      this._pollTimer = setInterval(() => {
+        const current = clipboard.readText()
+        if (current !== lastText) {
+          lastText = current
+          if (this._callback) {
+            this._callback()
+          }
+        }
+      }, 500)
+    } else {
+      ;(addon as NativeAddon).startMonitor(() => {
+        if (this._callback) {
+          this._callback()
+        }
+      })
+    }
   }
 
   /**
@@ -124,7 +151,14 @@ export class ClipboardMonitor {
       return
     }
 
-    ;(addon as NativeAddon).stopMonitor()
+    if (platform === 'linux') {
+      if (this._pollTimer !== null) {
+        clearInterval(this._pollTimer)
+        this._pollTimer = null
+      }
+    } else {
+      ;(addon as NativeAddon).stopMonitor()
+    }
     this._isMonitoring = false
     this._callback = null
   }
@@ -207,11 +241,17 @@ export class WindowMonitor {
 
     this._callback = callback
     this._isMonitoring = true
-    ;(addon as NativeAddon).startWindowMonitor((windowInfo) => {
-      if (this._callback) {
-        this._callback(windowInfo)
-      }
-    })
+
+    if (platform === 'linux') {
+      // Linux 降级：暂不支持窗口焦点监控，静默忽略
+      console.warn('[WindowMonitor] Linux 平台暂不支持原生窗口监控，功能已降级')
+    } else {
+      ;(addon as NativeAddon).startWindowMonitor((windowInfo) => {
+        if (this._callback) {
+          this._callback(windowInfo)
+        }
+      })
+    }
   }
 
   /**
@@ -222,7 +262,9 @@ export class WindowMonitor {
       return
     }
 
-    ;(addon as NativeAddon).stopWindowMonitor()
+    if (platform !== 'linux') {
+      ;(addon as NativeAddon).stopWindowMonitor()
+    }
     this._isMonitoring = false
     this._callback = null
   }
@@ -246,6 +288,10 @@ export class WindowManager {
    * - Windows: { app, pid }
    */
   static getActiveWindow(): { app: string; bundleId?: string; pid?: number } | null {
+    if (platform === 'linux') {
+      return null
+    }
+
     const result = (addon as NativeAddon).getActiveWindow()
     if (!result || result.error) {
       return null
@@ -261,6 +307,36 @@ export class WindowManager {
    * @returns 是否激活成功
    */
   static activateWindow(identifier: string | number): boolean {
+    if (platform === 'linux') {
+      // Linux 平台尝试使用 wmctrl 激活窗口
+      try {
+        if (typeof identifier === 'number') {
+          // 如果是 PID，查找对应的窗口 ID
+          // 使用 execSync 确保操作同步执行
+          const stdout = execSync('wmctrl -lp').toString()
+          const lines = stdout.split('\n')
+          for (const line of lines) {
+            const parts = line.split(/\s+/).filter(Boolean)
+            if (parts.length >= 3 && parts[2] === identifier.toString()) {
+              const wid = parts[0]
+              spawnSync('wmctrl', ['-ia', wid])
+              break
+            }
+          }
+        } else if (typeof identifier === 'string' && identifier.startsWith('0x')) {
+          // 如果是窗口 ID
+          spawnSync('wmctrl', ['-ia', identifier])
+        } else {
+          // 如果是字符串，尝试按标题/类名激活
+          spawnSync('wmctrl', ['-a', identifier])
+        }
+        return true
+      } catch (e) {
+        console.error('[Native] Linux activateWindow 失败:', e)
+        return false
+      }
+    }
+
     if (platform === 'darwin') {
       // macOS: bundleId 是字符串
       if (typeof identifier !== 'string') {
@@ -288,6 +364,9 @@ export class WindowManager {
    * @returns {boolean} 是否成功
    */
   static simulatePaste(): boolean {
+    if (platform === 'linux') {
+      return false
+    }
     return (addon as NativeAddon).simulatePaste()
   }
 
@@ -310,6 +389,10 @@ export class WindowManager {
    * WindowManager.simulateKeyboardTap('s', 'meta', 'shift');
    */
   static simulateKeyboardTap(key: string, ...modifiers: string[]): boolean {
+    if (platform === 'linux') {
+      return false
+    }
+
     if (typeof key !== 'string' || !key) {
       throw new TypeError('key must be a non-empty string')
     }
@@ -322,6 +405,9 @@ export class WindowManager {
    * @returns {boolean} 是否成功
    */
   static unicodeType(segment: string): boolean {
+    if (platform === 'linux') {
+      return false
+    }
     return (addon as NativeAddon).unicodeType(segment)
   }
 
@@ -368,6 +454,10 @@ export class WindowManager {
    * @returns 是否成功
    */
   static simulateMouseMove(x: number, y: number): boolean {
+    if (platform === 'linux') {
+      return false
+    }
+
     if (typeof x !== 'number' || typeof y !== 'number') {
       throw new TypeError('x and y must be numbers')
     }
@@ -384,6 +474,10 @@ export class WindowManager {
    * @returns 是否成功
    */
   static simulateMouseClick(x: number, y: number): boolean {
+    if (platform === 'linux') {
+      return false
+    }
+
     if (typeof x !== 'number' || typeof y !== 'number') {
       throw new TypeError('x and y must be numbers')
     }
@@ -400,6 +494,10 @@ export class WindowManager {
    * @returns 是否成功
    */
   static simulateMouseDoubleClick(x: number, y: number): boolean {
+    if (platform === 'linux') {
+      return false
+    }
+
     if (typeof x !== 'number' || typeof y !== 'number') {
       throw new TypeError('x and y must be numbers')
     }
@@ -416,6 +514,10 @@ export class WindowManager {
    * @returns 是否成功
    */
   static simulateMouseRightClick(x: number, y: number): boolean {
+    if (platform === 'linux') {
+      return false
+    }
+
     if (typeof x !== 'number' || typeof y !== 'number') {
       throw new TypeError('x and y must be numbers')
     }
@@ -474,6 +576,9 @@ export class MouseMonitor {
 
     MouseMonitor._callback = callback
     MouseMonitor._isMonitoring = true
+    if (platform === 'linux') {
+      return
+    }
     ;(addon as NativeAddon).startMouseMonitor(buttonType, longPressMs, () => {
       if (MouseMonitor._callback) {
         return MouseMonitor._callback()
@@ -489,7 +594,9 @@ export class MouseMonitor {
       return
     }
 
-    ;(addon as NativeAddon).stopMouseMonitor()
+    if (platform !== 'linux') {
+      ;(addon as NativeAddon).stopMouseMonitor()
+    }
     MouseMonitor._isMonitoring = false
     MouseMonitor._callback = null
   }
@@ -580,23 +687,26 @@ export class UwpManager {
  */
 export class IconExtractor {
   /**
-   * 获取文件/应用的图标（PNG 格式 Buffer）
-   * @param filePath - 文件路径（可以是 .exe、.lnk、.dll 或任何文件类型）
-   * @param size - 图标尺寸：16 | 32 | 64 | 256，默认 32
-   * @returns PNG 格式的图标数据，失败时返回 null
+   * 异步获取文件/应用的图标（PNG 格式 Buffer）
+   * @param {string} filePath - 文件路径（可以是 .exe、.lnk、.dll 或任何文件类型）
+   * @returns {Promise<Buffer>} Promise，resolve 为 PNG 格式的图标数据
+   * @example
+   * // 获取 exe 的图标
+   * const icon = await IconExtractor.getFileIcon('C:\\Windows\\notepad.exe');
+   *
+   * // 保存为文件
+   * const fs = require('fs');
+   * const icon = await IconExtractor.getFileIcon('C:\\Windows\\notepad.exe');
+   * if (icon) fs.writeFileSync('icon.png', icon);
    */
-  static getFileIcon(filePath: string, size: 16 | 32 | 64 | 256 = 32): Buffer | null {
-    if (platform !== 'win32') {
-      throw new Error('getFileIcon is only supported on Windows')
+  static getFileIcon(filePath: string): Promise<Buffer> {
+    if (platform !== 'win32' && platform !== 'darwin') {
+      throw new Error('getFileIcon is only supported on Windows and macOS')
     }
     if (typeof filePath !== 'string' || !filePath) {
       throw new TypeError('filePath must be a non-empty string')
     }
-    const validSizes = [16, 32, 64, 256]
-    if (!validSizes.includes(size)) {
-      throw new TypeError(`size must be one of: ${validSizes.join(', ')}`)
-    }
-    return (addon as NativeAddon).getFileIcon(filePath, size)
+    return (addon as NativeAddon).getFileIcon(filePath)
   }
 }
 
@@ -648,6 +758,18 @@ export class ColorPicker {
 
     ColorPicker._callback = callback
     ColorPicker._isActive = true
+
+    if (platform === 'linux') {
+      // Linux 暂不支持 ColorPicker，直接返回失败
+      ColorPicker._isActive = false
+      if (ColorPicker._callback) {
+        const cb = ColorPicker._callback
+        ColorPicker._callback = null
+        cb({ success: false, hex: null })
+      }
+      return
+    }
+
     ;(addon as NativeAddon).startColorPicker((result) => {
       ;(addon as NativeAddon).stopColorPicker()
 
@@ -668,7 +790,9 @@ export class ColorPicker {
       return
     }
 
-    ;(addon as NativeAddon).stopColorPicker()
+    if (platform !== 'linux') {
+      ;(addon as NativeAddon).stopColorPicker()
+    }
     ColorPicker._isActive = false
     ColorPicker._callback = null
   }

@@ -1,10 +1,9 @@
-import { app, dialog, ipcMain, shell } from 'electron'
+import { app, ipcMain, shell } from 'electron'
 import { promises as fs } from 'fs'
-import fsSync from 'fs'
 import path from 'path'
 import { pinyin as getPinyin } from 'pinyin-pro'
-import plist from 'simple-plist'
 import databaseAPI from '../shared/database'
+import { openDialog } from '../../utils/windowUtils'
 
 /**
  * 本地启动项类型
@@ -23,51 +22,6 @@ export interface LocalShortcut {
 }
 
 const LOCAL_SHORTCUTS_KEY = 'local-shortcuts'
-
-/**
- * 获取 macOS 应用图标文件路径
- */
-function getMacAppIconFile(appPath: string): Promise<string> {
-  return new Promise((resolve) => {
-    const plistPath = path.join(appPath, 'Contents', 'Info.plist')
-
-    plist.readFile(plistPath, (err: any, data: any) => {
-      if (err || !data || !data.CFBundleIconFile) {
-        // 返回系统默认图标
-        return resolve(
-          '/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns'
-        )
-      }
-
-      const iconFileName = data.CFBundleIconFile
-      const baseIconPath = path.join(appPath, 'Contents', 'Resources', iconFileName)
-
-      // 尝试多种扩展名
-      const iconCandidates = [
-        baseIconPath,
-        `${baseIconPath}.icns`,
-        `${baseIconPath}.tiff`,
-        `${baseIconPath}.png`
-      ]
-
-      // 同步检查文件存在性
-      for (const candidate of iconCandidates) {
-        try {
-          if (fsSync.existsSync(candidate)) {
-            return resolve(candidate)
-          }
-        } catch {
-          continue
-        }
-      }
-
-      // 都找不到，返回默认图标
-      resolve(
-        '/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/GenericApplicationIcon.icns'
-      )
-    })
-  })
-}
 
 /**
  * 本地启动 API - 主程序专用
@@ -129,18 +83,19 @@ export class LocalShortcutsAPI {
       } else {
         properties = ['openFile']
       }
-
       // 打开文件选择对话框
-      const result = await dialog.showOpenDialog(this.mainWindow, {
-        title: type === 'folder' ? '选择文件夹' : '选择文件或应用',
-        properties
-      })
-
-      if (result.canceled || result.filePaths.length === 0) {
-        return { success: false, error: '用户取消选择' }
+      const result = await openDialog(
+        this.mainWindow,
+        {
+          title: type === 'folder' ? '选择文件夹' : '选择文件或应用',
+          properties
+        },
+        '用户取消选择'
+      )
+      if (!result.success) {
+        return result
       }
-
-      const selectedPath = result.filePaths[0]
+      const selectedPath = result.data!.filePaths[0]
 
       // 获取文件信息
       const stats = await fs.stat(selectedPath)
@@ -174,9 +129,8 @@ export class LocalShortcutsAPI {
       if (itemType === 'app') {
         // 应用程序使用 ztools-icon:// 协议（与系统应用扫描器一致）
         if (process.platform === 'darwin') {
-          // macOS: 提取 .app 内部的 .icns 图标文件路径
-          const iconFilePath = await getMacAppIconFile(selectedPath)
-          icon = `ztools-icon://${encodeURIComponent(iconFilePath)}`
+          // macOS: 直接使用 .app 路径，由原生层提取图标
+          icon = `ztools-icon://${encodeURIComponent(selectedPath)}`
         } else {
           // Windows: 直接使用 .exe 或 .lnk 路径
           icon = `ztools-icon://${encodeURIComponent(selectedPath)}`
@@ -230,8 +184,8 @@ export class LocalShortcutsAPI {
 
       console.log('[LocalShortcut] 添加本地启动项成功:', shortcut.name)
 
-      // 通知渲染进程刷新指令列表
-      this.mainWindow?.webContents.send('apps-changed')
+      // 通知渲染进程刷新本地启动项
+      this.mainWindow?.webContents.send('local-shortcuts-changed')
 
       return { success: true }
     } catch (error) {
@@ -279,9 +233,8 @@ export class LocalShortcutsAPI {
       if (itemType === 'app') {
         // 应用程序使用 ztools-icon:// 协议（与系统应用扫描器一致）
         if (process.platform === 'darwin') {
-          // macOS: 提取 .app 内部的 .icns 图标文件路径
-          const iconFilePath = await getMacAppIconFile(selectedPath)
-          icon = `ztools-icon://${encodeURIComponent(iconFilePath)}`
+          // macOS: 直接使用 .app 路径，由原生层提取图标
+          icon = `ztools-icon://${encodeURIComponent(selectedPath)}`
         } else {
           // Windows: 直接使用 .exe 或 .lnk 路径
           icon = `ztools-icon://${encodeURIComponent(selectedPath)}`
@@ -335,8 +288,8 @@ export class LocalShortcutsAPI {
 
       console.log('[LocalShortcut] 添加本地启动项成功:', shortcut.name)
 
-      // 通知渲染进程刷新指令列表
-      this.mainWindow?.webContents.send('apps-changed')
+      // 通知渲染进程刷新本地启动项
+      this.mainWindow?.webContents.send('local-shortcuts-changed')
 
       return { success: true }
     } catch (error) {
@@ -361,8 +314,8 @@ export class LocalShortcutsAPI {
 
       console.log('[LocalShortcut] 删除本地启动项成功:', id)
 
-      // 通知渲染进程刷新指令列表
-      this.mainWindow?.webContents.send('apps-changed')
+      // 通知渲染进程刷新本地启动项
+      this.mainWindow?.webContents.send('local-shortcuts-changed')
 
       return { success: true }
     } catch (error) {
@@ -407,8 +360,8 @@ export class LocalShortcutsAPI {
         shortcut.alias || '(无别名)'
       )
 
-      // 通知渲染进程刷新指令列表
-      this.mainWindow?.webContents.send('apps-changed')
+      // 通知渲染进程刷新本地启动项
+      this.mainWindow?.webContents.send('local-shortcuts-changed')
 
       return { success: true }
     } catch (error) {

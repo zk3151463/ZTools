@@ -3,18 +3,16 @@
  * 提取自 commandDataStore.ts，便于单元测试
  */
 
+import { getCommandId as _getCommandId, type CommandIdLike } from '@shared/commandShared'
+
 interface MatchInfo {
   indices: Array<[number, number]>
   value: string
   key: string
 }
 
-interface CommandLike {
-  name: string
+interface CommandLike extends CommandIdLike {
   path: string
-  pluginName?: string
-  featureCode?: string
-  cmdType?: string
   subType?: string
   [key: string]: any
 }
@@ -23,9 +21,8 @@ interface CommandLike {
  * 生成指令唯一标识（与设置插件保持一致）
  * 格式: pluginName:featureCode:cmdName:cmdType
  */
-export function getCommandId(cmd: CommandLike): string {
-  const cmdType = cmd.cmdType || 'text'
-  return `${cmd.pluginName || ''}:${cmd.featureCode || ''}:${cmd.name}:${cmdType}`
+export function getCommandId(cmd: CommandIdLike): string {
+  return _getCommandId(cmd)
 }
 
 /**
@@ -61,19 +58,29 @@ export function applySpecialConfig<T extends CommandLike>(
  * @param text 被搜索的文本
  * @param query 搜索关键词
  * @param matches 匹配信息
+ * @param command 指令对象（可选，用于类型加权）
  * @returns 分数（越高越好）
  */
-export function calculateMatchScore(text: string, query: string, matches?: MatchInfo[]): number {
-  if (!matches || matches.length === 0) return 0
-
-  let score = 0
+export function calculateMatchScore(
+  text: string,
+  query: string,
+  matches?: MatchInfo[],
+  command?: CommandLike
+): number {
   const lowerText = text.toLowerCase()
   const lowerQuery = query.toLowerCase()
 
-  // 1. 完全匹配（最高优先级）
+  // 1. 完全匹配（最高优先级，不区分类型）
   if (lowerText === lowerQuery) {
     return 10000
   }
+
+  // 如果没有匹配信息，返回 0
+  if (!matches || matches.length === 0) {
+    return 0
+  }
+
+  let score = 0
 
   // 2. 前缀匹配（次高优先级）
   if (lowerText.startsWith(lowerQuery)) {
@@ -97,6 +104,11 @@ export function calculateMatchScore(text: string, query: string, matches?: Match
   if (matches.length > 0 && matches[0].indices && matches[0].indices.length > 0) {
     const firstMatchPosition = matches[0].indices[0][0]
     score += Math.max(0, 100 - firstMatchPosition)
+  }
+
+  // 6. 类型权重：系统应用权重略高于其他类型（仅在非完全匹配时生效）
+  if (command && command.type === 'direct' && command.subType === 'app') {
+    score += 300
   }
 
   return score

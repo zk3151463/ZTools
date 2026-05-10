@@ -32,6 +32,12 @@
       "cmds": ["Shutdown", "关机"]
     },
     {
+      "code": "logoff",
+      "explain": "注销",
+      "icon": "logoff.png",
+      "cmds": ["Log Off", "Sign Out", "注销", "退出登录"]
+    },
+    {
       "code": "sleep",
       "explain": "睡眠",
       "icon": "sleep.png",
@@ -53,6 +59,19 @@
           "match": "/^https?:\\/\\/[^\\s/$.?#]\\S+$|^[a-z0-9][-a-z0-9]{0,62}(\\.[a-z0-9][-a-z0-9]{0,62}){1,10}(:[0-9]{1,5})?$/im",
           "label": "打开网址",
           "minLength": 3
+        }
+      ]
+    },
+    {
+      "code": "open-folder",
+      "explain": "前往文件夹",
+      "icon": "folder.png",
+      "cmds": [
+        {
+          "type": "regex",
+          "match": "/^(?:~?\\/[^/\\n\\r\\f\\v]+)+\\/?$/",
+          "label": "前往文件夹",
+          "minLength": 2
         }
       ]
     },
@@ -91,10 +110,22 @@
       ]
     },
     {
+      "code": "add-to-wakeup-blacklist",
+      "explain": "将当前活动窗口的应用添加到唤醒黑名单",
+      "icon": "wakeup-blacklist.png",
+      "cmds": ["添加到唤醒黑名单", "Wakeup Blacklist"]
+    },
+    {
       "code": "color-picker",
       "explain": "屏幕取色",
       "icon": "color-picker.png",
       "cmds": ["取色", "Color Picker", "屏幕取色"]
+    },
+    {
+      "code": "screenshot",
+      "explain": "截图并复制到剪贴板",
+      "icon": "screenshot.png",
+      "cmds": ["截图", "截屏", "Screenshot", "Screen Capture"]
     }
   ]
 }

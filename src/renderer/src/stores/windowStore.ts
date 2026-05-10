@@ -36,6 +36,8 @@ export type AutoClearOption = 'immediately' | '1m' | '2m' | '3m' | '5m' | '10m' 
 
 // 搜索框模式选项
 export type SearchMode = 'aggregate' | 'list'
+export type TabKeyFunction = 'navigate' | 'target-command'
+export type BuiltInShortcutKey = 'search' | 'closePlugin' | 'killPlugin'
 
 // 更新下载状态
 interface UpdateDownloadInfo {
@@ -57,9 +59,15 @@ export const useWindowStore = defineStore('window', () => {
 
   // Tab 键目标指令
   const tabTargetCommand = ref('')
+  const tabKeyFunction = ref<TabKeyFunction>('navigate')
 
   // 空格打开指令
   const spaceOpenCommand = ref(false)
+
+  // 内置应用快捷键开关
+  const builtInSearchShortcutEnabled = ref(true)
+  const builtInClosePluginShortcutEnabled = ref(true)
+  const builtInKillPluginShortcutEnabled = ref(true)
 
   // 悬浮球双击目标指令
   const floatingBallDoubleClickCommand = ref('')
@@ -205,8 +213,24 @@ export const useWindowStore = defineStore('window', () => {
     tabTargetCommand.value = value
   }
 
+  function updateTabKeyFunction(value: TabKeyFunction): void {
+    tabKeyFunction.value = value
+  }
+
   function updateSpaceOpenCommand(value: boolean): void {
     spaceOpenCommand.value = value
+  }
+
+  function updateBuiltInShortcutEnabled(key: BuiltInShortcutKey, value: boolean): void {
+    if (key === 'search') {
+      builtInSearchShortcutEnabled.value = value
+      return
+    }
+    if (key === 'closePlugin') {
+      builtInClosePluginShortcutEnabled.value = value
+      return
+    }
+    builtInKillPluginShortcutEnabled.value = value
   }
 
   function updateFloatingBallDoubleClickCommand(value: string): void {
@@ -524,6 +548,11 @@ export const useWindowStore = defineStore('window', () => {
         if (data.searchMode) {
           searchMode.value = data.searchMode
         }
+        if (data.tabKeyFunction !== undefined) {
+          tabKeyFunction.value = data.tabKeyFunction
+        } else {
+          tabKeyFunction.value = data.tabTargetCommand ? 'target-command' : 'navigate'
+        }
         if (data.tabTargetCommand !== undefined) {
           tabTargetCommand.value = data.tabTargetCommand
         }
@@ -532,6 +561,12 @@ export const useWindowStore = defineStore('window', () => {
         }
         if (data.floatingBallDoubleClickCommand !== undefined) {
           floatingBallDoubleClickCommand.value = data.floatingBallDoubleClickCommand
+        }
+        if (data.builtinAppShortcutsEnabled !== undefined) {
+          const config = data.builtinAppShortcutsEnabled || {}
+          builtInSearchShortcutEnabled.value = config.search !== false
+          builtInClosePluginShortcutEnabled.value = config.closePlugin !== false
+          builtInKillPluginShortcutEnabled.value = config.killPlugin !== false
         }
       } else {
         // 默认蓝色
@@ -586,10 +621,16 @@ export const useWindowStore = defineStore('window', () => {
     updatePinnedRows,
     searchMode,
     updateSearchMode,
+    tabKeyFunction,
+    updateTabKeyFunction,
     tabTargetCommand,
     updateTabTargetCommand,
     spaceOpenCommand,
     updateSpaceOpenCommand,
+    builtInSearchShortcutEnabled,
+    builtInClosePluginShortcutEnabled,
+    builtInKillPluginShortcutEnabled,
+    updateBuiltInShortcutEnabled,
     floatingBallDoubleClickCommand,
     updateFloatingBallDoubleClickCommand,
     updateTheme,

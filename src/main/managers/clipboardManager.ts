@@ -13,15 +13,17 @@ import {
   writeClipboardFiles
 } from '../utils/clipboardFiles'
 import { sleep } from '../utils/common'
+import api from '../api'
 import pluginManager from './pluginManager'
 import ClipboardMonitor, { WindowMonitor, WindowManager } from '../core/native'
 // 剪贴板类型
 type ClipboardType = 'text' | 'image' | 'file'
 
-type LastCopiedContent = {
+export type LastCopiedContent = {
   type: 'text' | 'image' | 'file'
   data: string | FileItem[]
   timestamp: number
+  sequence: number
 }
 
 // 文件项
@@ -66,13 +68,15 @@ interface ClipboardConfig {
   maxItems: number // 最大条数
   maxImageSize: number // 单张图片最大大小（bytes）
   maxTotalImageSize: number // 图片总大小限制（bytes）
+  retentionDays: number // 历史记录保留天数
 }
 
 // 默认配置
 const DEFAULT_CONFIG: ClipboardConfig = {
   maxItems: 1000,
   maxImageSize: 10 * 1024 * 1024, // 10MB
-  maxTotalImageSize: 500 * 1024 * 1024 // 500MB
+  maxTotalImageSize: 500 * 1024 * 1024, // 500MB
+  retentionDays: 180 // 默认半年
 }
 
 // 剪贴板准备等待时间（复制后有些应用需要一点时间才能真正写入剪贴板）
@@ -91,6 +95,7 @@ class ClipboardManager {
 
   // 记录最后一次复制的内容（统一管理）
   private lastCopiedContent: LastCopiedContent | null = null
+  private lastCopiedSequence = 0
 
   // 临时取消剪贴板监听的计时器（防止 paste API 写入剪贴板时自我触发）
   private cancelWatchTimeout: ReturnType<typeof setTimeout> | null = null
@@ -105,6 +110,17 @@ class ClipboardManager {
   private async init(): Promise<void> {
     // 确保图片目录存在
     await fs.mkdir(this.IMAGE_DIR, { recursive: true })
+
+    // 读取剪贴板配置（如：历史记录保存天数）
+    try {
+      const settings = api.dbGet('settings-general')
+      if (settings && typeof settings.clipboardRetentionDays === 'number') {
+        console.log('[Clipboard] 加载剪贴板配置，保存天数:', settings.clipboardRetentionDays)
+        this.updateConfig({ retentionDays: settings.clipboardRetentionDays })
+      }
+    } catch (error) {
+      console.error('[Clipboard] 加载剪贴板配置失败:', error)
+    }
 
     // 启动剪贴板监听器（原生事件已做去重）
     this.clipboardMonitor.start(() => {
@@ -248,7 +264,8 @@ class ClipboardManager {
       this.lastCopiedContent = {
         type: 'file',
         data: files, // 存储完整的 FileItem 对象
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        sequence: ++this.lastCopiedSequence
       }
 
       // 生成 hash（基于所有文件路径）
@@ -294,7 +311,8 @@ class ClipboardManager {
       this.lastCopiedContent = {
         type: 'image',
         data: base64,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        sequence: ++this.lastCopiedSequence
       }
 
       // 检查图片大小
@@ -352,7 +370,8 @@ class ClipboardManager {
     this.lastCopiedContent = {
       type: 'text',
       data: text,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      sequence: ++this.lastCopiedSequence
     }
 
     return {
@@ -405,21 +424,45 @@ class ClipboardManager {
     }
   }
 
-  // 检查并清理旧记录（超过最大条数）
+  // 检查并清理旧记录（超过最大条数或超过保留天数）
   private async checkAndCleanOldItems(): Promise<void> {
     try {
       const allItems = await this.getAllItems()
+      if (allItems.length === 0) return
 
-      if (allItems.length > this.config.maxItems) {
-        // 按时间排序，删除最旧的
-        const sortedItems = allItems.sort((a, b) => a.timestamp - b.timestamp)
-        const toDelete = sortedItems.slice(0, allItems.length - this.config.maxItems)
+      // 按时间排序，旧的在前
+      const sortedItems = allItems.sort((a, b) => a.timestamp - b.timestamp)
+      const toDelete = new Set<ClipboardItem>()
 
+      // 1. 基于保留天数过滤过期记录
+      const expirationTimestamp = Date.now() - this.config.retentionDays * 24 * 60 * 60 * 1000
+      for (const item of sortedItems) {
+        if (item.timestamp < expirationTimestamp) {
+          toDelete.add(item)
+        } else {
+          // 由于已按时间排序，如果当前这条不过期，后面的肯定更不过期
+          break
+        }
+      }
+
+      // 2. 基于最大条数过滤多出记录
+      const remainingCount = sortedItems.length - toDelete.size
+      if (remainingCount > this.config.maxItems) {
+        let countToDelete = remainingCount - this.config.maxItems
+        for (const item of sortedItems) {
+          if (!toDelete.has(item)) {
+            toDelete.add(item)
+            countToDelete--
+          }
+          if (countToDelete <= 0) break
+        }
+      }
+
+      if (toDelete.size > 0) {
         for (const item of toDelete) {
           await this.deleteItem(item.id)
         }
-
-        console.log(`清理了 ${toDelete.length} 条旧记录`)
+        console.log(`[Clipboard] 清理了 ${toDelete.size} 条过期/超限的旧记录`)
       }
     } catch (error) {
       console.error('[Clipboard] 清理旧记录失败:', error)
@@ -754,6 +797,11 @@ class ClipboardManager {
     }
   }
 
+  // 获取最后一次复制内容的序号
+  public getLastCopiedSequence(): number {
+    return this.lastCopiedContent?.sequence ?? 0
+  }
+
   // 获取最后一次复制的文本（在指定时间内）- 兼容旧 API
   public async getLastCopiedText(timeLimit: number): Promise<string | null> {
     const content = await this.getLastCopiedContent(timeLimit)
@@ -768,14 +816,15 @@ class ClipboardManager {
 
   // 获取最后复制的内容（统一接口）
   public async getLastCopiedContent(
-    timeLimit?: number // 可选：时间限制（毫秒），不传或传 0 表示无时间限制
+    timeLimit?: number, // 可选：时间限制（毫秒），不传或传 0 表示无时间限制
+    minSequence?: number // 可选：仅接受晚于该序号的新复制内容
   ): Promise<LastCopiedContent | null> {
     const cachedContent = this.getValidLastCopiedContent(timeLimit)
-    if (cachedContent) {
+    if (cachedContent && (!minSequence || cachedContent.sequence > minSequence)) {
       return cachedContent
     }
 
-    const initialTimestamp = this.lastCopiedContent?.timestamp ?? 0
+    const initialSequence = Math.max(this.lastCopiedContent?.sequence ?? 0, minSequence ?? 0)
     const waitMs =
       timeLimit && timeLimit > 0
         ? Math.min(timeLimit, CLIPBOARD_READY_WAIT_MS)
@@ -786,7 +835,7 @@ class ClipboardManager {
       await sleep(CLIPBOARD_RETRY_INTERVAL_MS)
 
       const latestContent = this.getValidLastCopiedContent(timeLimit)
-      if (latestContent && latestContent.timestamp !== initialTimestamp) {
+      if (latestContent && latestContent.sequence > initialSequence) {
         return latestContent
       }
     }

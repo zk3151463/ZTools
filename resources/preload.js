@@ -65,10 +65,136 @@ let pluginDetachCallback = null
 let mainPushCallback = null // { callback, selectCallback }
 let hotkeyRecordedCallback = null
 let windowMaterialChangeCallback = null
+let themeChangeCallback = null
 let logEntriesCallback = null
 let foundInPageCallback = null
 // 插件侧注册的 MCP 工具处理器，实际执行时由主进程回调到这里。
 const registeredTools = new Map()
+
+/**
+ * 创建懒注册的 IPC 事件监听器。
+ * 仅在首次设置回调时注册 ipcRenderer.on，回调置空后可通过 detach 移除监听。
+ * @param {string} channel  IPC 通道名
+ * @param {function} handler 接收 (event, ...args) 的处理函数
+ * @returns {{ attach: function, detach: function }}
+ */
+function lazyListen(channel, handler) {
+  let listening = false
+  return {
+    attach() {
+      if (!listening) {
+        electron.ipcRenderer.on(channel, handler)
+        listening = true
+      }
+    },
+    detach() {
+      if (listening) {
+        electron.ipcRenderer.removeListener(channel, handler)
+        listening = false
+      }
+    }
+  }
+}
+
+// ── 懒注册 IPC 事件实例 ──
+// 以下事件仅在插件调用对应 onXxx 注册回调后才开始监听，避免未订阅时产生无效 IPC 通信
+
+// 剪贴板变化事件（由 clipboard.onChange 触发注册）
+const lazyClipboardChange = lazyListen('clipboard-change', (_e, item) => {
+  if (clipboardChangeCallback) clipboardChangeCallback(item)
+})
+
+// 插件退出事件（由 onPluginOut 触发注册）
+const lazyPluginOut = lazyListen('plugin-out', (_e, isKill) => {
+  if (pluginOutCallback) pluginOutCallback(isKill)
+})
+
+// 插件分离事件（由 onPluginDetach 触发注册）
+const lazyPluginDetach = lazyListen('plugin-detach', () => {
+  if (pluginDetachCallback) pluginDetachCallback()
+})
+
+// mainPush 查询请求（由 onMainPush 触发注册，搜索时主进程转发）
+const lazyMainPushQuery = lazyListen('main-push-query', (event, { queryData, callId }) => {
+  try {
+    let allResults = []
+    if (mainPushCallback) {
+      try {
+        const results = mainPushCallback.callback(queryData)
+        if (Array.isArray(results) && results.length > 0) {
+          allResults = allResults.concat(results)
+        }
+      } catch (e) {
+        console.error('mainPush callback error:', e)
+      }
+    }
+    electron.ipcRenderer.send(`main-push-result-${callId}`, {
+      success: true,
+      results: allResults
+    })
+  } catch (error) {
+    electron.ipcRenderer.send(`main-push-result-${callId}`, {
+      success: false,
+      error: error.message
+    })
+  }
+})
+
+// mainPush 选择事件（由 onMainPush 触发注册，用户选择搜索结果时触发）
+const lazyMainPushSelect = lazyListen('main-push-select', (event, { selectData, callId }) => {
+  try {
+    let shouldEnterPlugin = false
+    if (
+      mainPushCallback &&
+      mainPushCallback.selectCallback &&
+      typeof mainPushCallback.selectCallback === 'function'
+    ) {
+      try {
+        const result = mainPushCallback.selectCallback(selectData)
+        if (result === true) {
+          shouldEnterPlugin = true
+        }
+      } catch (e) {
+        console.error('mainPush selectCallback error:', e)
+      }
+    }
+    electron.ipcRenderer.send(`main-push-select-result-${callId}`, {
+      success: true,
+      shouldEnterPlugin
+    })
+  } catch (error) {
+    electron.ipcRenderer.send(`main-push-select-result-${callId}`, {
+      success: false,
+      error: error.message
+    })
+  }
+})
+
+// 快捷键录制事件（由 internal.onHotkeyRecorded 触发注册）
+const lazyHotkeyRecorded = lazyListen('hotkey-recorded', (_e, shortcut) => {
+  console.log('收到快捷键录制事件:', shortcut)
+  if (hotkeyRecordedCallback) hotkeyRecordedCallback(shortcut)
+})
+
+// 窗口材质更新事件（由 internal.onUpdateWindowMaterial 触发注册）
+const lazyWindowMaterial = lazyListen('update-window-material', (_e, material) => {
+  if (windowMaterialChangeCallback) windowMaterialChangeCallback(material)
+})
+
+// 主题信息更新事件（由 onThemeChange 触发注册）
+const lazyThemeChange = lazyListen('update-theme-info', (_e, themeInfo) => {
+  if (themeChangeCallback) themeChangeCallback(themeInfo)
+})
+
+// 调试日志推送事件（由 internal.onLogEntries 触发注册）
+const lazyLogEntries = lazyListen('log-entries', (_e, entries) => {
+  if (logEntriesCallback) logEntriesCallback(entries)
+})
+
+// 页面内查找结果事件（由 onFindInPageResult 触发注册）
+const lazyFoundInPage = lazyListen('found-in-page-result', (_e, result) => {
+  if (foundInPageCallback) foundInPageCallback(result)
+})
 
 /**
  * 统一派发插件进入事件（已注册回调时调用）
@@ -185,6 +311,15 @@ window.ztools = {
   getWindowType: () => electron.ipcRenderer.sendSync('get-window-type'),
   // 是否深色主题
   isDarkColors: () => electron.ipcRenderer.sendSync('is-dark-colors'),
+  // 获取当前主题信息（isDark, primaryColor, customColor, windowMaterial）
+  getThemeInfo: () => ipcSendSync('getThemeInfo'),
+  // 监听主题变更
+  onThemeChange: (callback) => {
+    if (typeof callback === 'function') {
+      themeChangeCallback = callback
+      lazyThemeChange.attach()
+    }
+  },
   sendInputEvent: async (event) => await electron.ipcRenderer.invoke('send-input-event', event),
   // 在当前页面中查找文本
   findInPage: (text, options) => electron.ipcRenderer.invoke('find-in-page', text, options),
@@ -195,11 +330,15 @@ window.ztools = {
   onFindInPageResult: (callback) => {
     if (callback && typeof callback === 'function') {
       foundInPageCallback = callback
+      lazyFoundInPage.attach()
     }
   },
   // 取消监听页面查找结果
   offFindInPageResult: (callback) => {
-    if (foundInPageCallback === callback) foundInPageCallback = null
+    if (foundInPageCallback === callback) {
+      foundInPageCallback = null
+      lazyFoundInPage.detach()
+    }
   },
   // 模拟键盘按键
   simulateKeyboardTap: (key, ...modifiers) => {
@@ -237,6 +376,7 @@ window.ztools = {
     console.log('插件请求onPluginOut')
     if (callback && typeof callback === 'function') {
       pluginOutCallback = callback
+      lazyPluginOut.attach()
     }
   },
   // 插件分离事件
@@ -244,6 +384,7 @@ window.ztools = {
     console.log('插件请求onPluginDetach')
     if (callback && typeof callback === 'function') {
       pluginDetachCallback = callback
+      lazyPluginDetach.attach()
     }
   },
   // 监听主搜索推送（mainPush 功能）
@@ -251,6 +392,8 @@ window.ztools = {
     console.log('插件注册 onMainPush')
     if (callback && typeof callback === 'function') {
       mainPushCallback = { callback, selectCallback }
+      lazyMainPushQuery.attach()
+      lazyMainPushSelect.attach()
     }
   },
   // 兼容旧api
@@ -373,6 +516,9 @@ window.ztools = {
     // 监听剪贴板变化事件
     onChange: async (callback) => {
       clipboardChangeCallback = callback
+      if (callback) {
+        lazyClipboardChange.attach()
+      }
     }
   },
   // 复制文本到剪贴板
@@ -526,7 +672,7 @@ window.ztools = {
   readCurrentFolderPath: () => electron.ipcRenderer.invoke('plugin:read-current-folder-path'),
   // 读取当前浏览器窗口 URL（前提当前活动系统窗口是受支持浏览器）
   readCurrentBrowserUrl: () => electron.ipcRenderer.invoke('plugin:read-current-browser-url'),
-  // 获取文件系统图标（返回 base64 Data URL）
+  // 获取文件系统图标（返回 base64 Data URL，同步）
   getFileIcon: (filePath) => electron.ipcRenderer.sendSync('get-file-icon', filePath),
   // 插件跳转
   redirect: (label, payload) =>
@@ -658,7 +804,12 @@ window.ztools = {
     quitApp: async () => await electron.ipcRenderer.invoke('internal:quit-app'),
 
     // ==================== 指令管理 API ====================
+    // 返回设置插件使用的原始指令快照，用于构建 alias 可选目标列表。
+    // 这里返回的是主进程整理后的 canonical commands，不包含主窗口搜索阶段注入的 alias 搜索字段。
     getCommands: async () => await electron.ipcRenderer.invoke('internal:get-commands'),
+    // 保存完整 alias store。主进程会负责归一化、持久化，并触发 commands cache 失效与主窗口刷新。
+    updateCommandAliases: async (aliases) =>
+      await electron.ipcRenderer.invoke('internal:update-command-aliases', aliases),
 
     // ==================== 本地启动管理 API ====================
     localShortcuts: {
@@ -674,19 +825,54 @@ window.ztools = {
 
     // ==================== 插件管理 API ====================
     getPlugins: async () => await electron.ipcRenderer.invoke('internal:get-plugins'),
+    getDisabledPlugins: async () =>
+      await electron.ipcRenderer.invoke('internal:get-disabled-plugins'),
+    setPluginDisabled: async (pluginPath, disabled) =>
+      await electron.ipcRenderer.invoke('internal:set-plugin-disabled', pluginPath, disabled),
     getAllPlugins: async () => await electron.ipcRenderer.invoke('internal:get-all-plugins'),
     selectPluginFile: async () => await electron.ipcRenderer.invoke('internal:select-plugin-file'),
     importPlugin: async () => await electron.ipcRenderer.invoke('internal:import-plugin'),
+    getDevProjects: async () => await electron.ipcRenderer.invoke('internal:get-dev-projects'),
+    updateDevProjectsOrder: async (pluginNames) =>
+      await electron.ipcRenderer.invoke('internal:update-dev-projects-order', pluginNames),
     readPluginInfoFromZpx: async (zpxPath) =>
       await electron.ipcRenderer.invoke('internal:read-plugin-info-from-zpx', zpxPath),
     installPluginFromPath: async (zpxPath) =>
       await electron.ipcRenderer.invoke('internal:install-plugin-from-path', zpxPath),
     importDevPlugin: async (pluginPath) =>
       await electron.ipcRenderer.invoke('internal:import-dev-plugin', pluginPath),
+    scaffoldDevProject: async (params) =>
+      await electron.ipcRenderer.invoke('internal:scaffold-dev-project', params),
+    updateDevProjectMeta: async (projectName, meta) =>
+      await electron.ipcRenderer.invoke('internal:update-dev-project-meta', projectName, meta),
+    upsertDevProjectByConfigPath: async (pluginJsonPath) =>
+      await electron.ipcRenderer.invoke(
+        'internal:upsert-dev-project-by-config-path',
+        pluginJsonPath
+      ),
+    removeDevProject: async (pluginName) =>
+      await electron.ipcRenderer.invoke('internal:remove-dev-project', pluginName),
+    installDevPlugin: async (pluginPath) =>
+      await electron.ipcRenderer.invoke('internal:install-dev-plugin', pluginPath),
+    uninstallDevPlugin: async (pluginPath) =>
+      await electron.ipcRenderer.invoke('internal:uninstall-dev-plugin', pluginPath),
+    validateDevProject: async (pluginName) =>
+      await electron.ipcRenderer.invoke('internal:validate-dev-project', pluginName),
+    selectDevProjectConfig: async (pluginName, configPath) =>
+      await electron.ipcRenderer.invoke(
+        'internal:select-dev-project-config',
+        pluginName,
+        configPath
+      ),
+    packageDevProject: async (pluginName, packagePath, version) =>
+      await electron.ipcRenderer.invoke(
+        'internal:package-dev-project',
+        pluginName,
+        packagePath,
+        version
+      ),
     deletePlugin: async (pluginPath) =>
       await electron.ipcRenderer.invoke('internal:delete-plugin', pluginPath),
-    reloadPlugin: async (pluginPath) =>
-      await electron.ipcRenderer.invoke('internal:reload-plugin', pluginPath),
     getRunningPlugins: async () =>
       await electron.ipcRenderer.invoke('internal:get-running-plugins'),
     killPlugin: async (pluginPath) =>
@@ -699,16 +885,15 @@ window.ztools = {
       await electron.ipcRenderer.invoke('internal:install-plugin-from-npm', options),
     getPluginReadme: async (pluginPathOrName, pluginName) =>
       await electron.ipcRenderer.invoke('internal:get-plugin-readme', pluginPathOrName, pluginName),
-    getPluginDocKeys: async (pluginPath) =>
-      await electron.ipcRenderer.invoke('internal:get-plugin-doc-keys', pluginPath),
-    getPluginDoc: async (pluginPath, docKey) =>
-      await electron.ipcRenderer.invoke('internal:get-plugin-doc', pluginPath, docKey),
+    getPluginDocKeys: async (pluginRef) =>
+      await electron.ipcRenderer.invoke('internal:get-plugin-doc-keys', pluginRef),
+    getPluginDoc: async (pluginRef, docKey) =>
+      await electron.ipcRenderer.invoke('internal:get-plugin-doc', pluginRef, docKey),
     getPluginDataStats: async () =>
       await electron.ipcRenderer.invoke('internal:get-plugin-data-stats'),
-    clearPluginData: async (pluginName) =>
-      await electron.ipcRenderer.invoke('internal:clear-plugin-data', pluginName),
-    packagePlugin: async (pluginPath) =>
-      await electron.ipcRenderer.invoke('internal:package-plugin', pluginPath),
+    clearPluginData: async (pluginRef) =>
+      await electron.ipcRenderer.invoke('internal:clear-plugin-data', pluginRef),
+    exportAllPlugins: async () => await electron.ipcRenderer.invoke('internal:export-all-plugins'),
     getPluginMemoryInfo: async (pluginPath) =>
       await electron.ipcRenderer.invoke('internal:get-plugin-memory-info', pluginPath),
 
@@ -725,6 +910,7 @@ window.ztools = {
     onHotkeyRecorded: (callback) => {
       if (callback && typeof callback === 'function') {
         hotkeyRecordedCallback = callback
+        lazyHotkeyRecorded.attach()
       }
     },
 
@@ -792,6 +978,9 @@ window.ztools = {
     // 通知主渲染进程更新搜索框模式
     updateSearchMode: async (mode) =>
       await electron.ipcRenderer.invoke('internal:update-search-mode', mode),
+    // 通知主渲染进程更新 Tab 键功能配置
+    updateTabKeyFunction: async (mode) =>
+      await electron.ipcRenderer.invoke('internal:update-tab-key-function', mode),
     // 通知主渲染进程更新 Tab 键目标指令
     updateTabTarget: async (target) =>
       await electron.ipcRenderer.invoke('internal:update-tab-target', target),
@@ -821,6 +1010,9 @@ window.ztools = {
     // 监听窗口材质更新
     onUpdateWindowMaterial: (callback) => {
       windowMaterialChangeCallback = callback
+      if (callback) {
+        lazyWindowMaterial.attach()
+      }
     },
 
     // ==================== 应用更新 API ====================
@@ -866,6 +1058,10 @@ window.ztools = {
       await electron.ipcRenderer.invoke('internal:update-super-panel-blocked-apps', blockedApps),
     getCurrentWindowInfo: async () =>
       await electron.ipcRenderer.invoke('internal:get-current-window-info'),
+
+    // ==================== 唤醒黑名单 API ====================
+    updateWakeupBlacklist: async (blacklist) =>
+      await electron.ipcRenderer.invoke('internal:update-wakeup-blacklist', blacklist),
 
     // 超级面板翻译
     updateSuperPanelTranslate: async (enabled) =>
@@ -944,10 +1140,14 @@ window.ztools = {
     onLogEntries: (callback) => {
       if (callback && typeof callback === 'function') {
         logEntriesCallback = callback
+        lazyLogEntries.attach()
       }
     },
     offLogEntries: (callback) => {
-      if (logEntriesCallback === callback) logEntriesCallback = null
+      if (logEntriesCallback === callback) {
+        logEntriesCallback = null
+        lazyLogEntries.detach()
+      }
     }
   },
 
@@ -1141,89 +1341,10 @@ electron.ipcRenderer.on('on-plugin-enter', (event, launchParam) => {
   console.log('[PluginRuntime][Enter] enter-received-buffered', pendingEnterMeta)
 })
 
-// 监听插件退出事件
-electron.ipcRenderer.on('plugin-out', (event, isKill) => {
-  console.log('插件退出事件:', isKill)
-  if (pluginOutCallback) pluginOutCallback(isKill)
-})
-
-// 监听插件分离事件
-electron.ipcRenderer.on('plugin-detach', () => {
-  console.log('插件分离事件')
-  if (pluginDetachCallback) pluginDetachCallback()
-})
-
-electron.ipcRenderer.on('clipboard-change', (event, item) => {
-  console.log('剪贴板变化:', item)
-  if (clipboardChangeCallback) clipboardChangeCallback(item)
-})
-
 // 监听子输入框变化事件
 electron.ipcRenderer.on('sub-input-change', (event, details) => {
   console.log('子输入框变化:', details)
   if (subInputChangeCallback) subInputChangeCallback(details)
-})
-
-// 监听 mainPush 查询请求（搜索时主进程转发）
-electron.ipcRenderer.on('main-push-query', (event, { queryData, callId }) => {
-  try {
-    let allResults = []
-    if (mainPushCallback) {
-      try {
-        const results = mainPushCallback.callback(queryData)
-        if (Array.isArray(results) && results.length > 0) {
-          allResults = allResults.concat(results)
-        }
-      } catch (e) {
-        console.error('mainPush callback error:', e)
-      }
-    }
-    electron.ipcRenderer.send(`main-push-result-${callId}`, {
-      success: true,
-      results: allResults
-    })
-  } catch (error) {
-    electron.ipcRenderer.send(`main-push-result-${callId}`, {
-      success: false,
-      error: error.message
-    })
-  }
-})
-
-// 监听 mainPush 选择事件（用户选择搜索结果时触发）
-electron.ipcRenderer.on('main-push-select', (event, { selectData, callId }) => {
-  try {
-    let shouldEnterPlugin = false
-    if (
-      mainPushCallback &&
-      mainPushCallback.selectCallback &&
-      typeof mainPushCallback.selectCallback === 'function'
-    ) {
-      try {
-        const result = mainPushCallback.selectCallback(selectData)
-        if (result === true) {
-          shouldEnterPlugin = true
-        }
-      } catch (e) {
-        console.error('mainPush selectCallback error:', e)
-      }
-    }
-    electron.ipcRenderer.send(`main-push-select-result-${callId}`, {
-      success: true,
-      shouldEnterPlugin
-    })
-  } catch (error) {
-    electron.ipcRenderer.send(`main-push-select-result-${callId}`, {
-      success: false,
-      error: error.message
-    })
-  }
-})
-
-// 监听快捷键录制事件
-electron.ipcRenderer.on('hotkey-recorded', (event, shortcut) => {
-  console.log('收到快捷键录制事件:', shortcut)
-  if (hotkeyRecordedCallback) hotkeyRecordedCallback(shortcut)
 })
 
 // 监听主进程的插件方法调用请求（用于无界面插件）
@@ -1543,18 +1664,3 @@ electron.ipcRenderer.on('get-plugin-mode', (event, { featureCode, callId }) => {
     }
   })
 })()
-
-// 监听主进程发送的窗口材质更新事件
-electron.ipcRenderer.on('update-window-material', (event, material) => {
-  if (windowMaterialChangeCallback) windowMaterialChangeCallback(material)
-})
-
-// 监听主进程推送的调试日志
-electron.ipcRenderer.on('log-entries', (event, entries) => {
-  if (logEntriesCallback) logEntriesCallback(entries)
-})
-
-// 监听页面内查找结果
-electron.ipcRenderer.on('found-in-page-result', (event, result) => {
-  if (foundInPageCallback) foundInPageCallback(result)
-})

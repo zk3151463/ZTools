@@ -22,6 +22,7 @@ export class WindowAPI {
   private setupIPC(): void {
     ipcMain.on('hide-window', () => this.hideWindow())
     ipcMain.on('resize-window', (_event, height: number) => this.resizeWindow(height))
+    ipcMain.on('update-launch-context', (_event, context: any) => this.updateLaunchContext(context))
     ipcMain.handle('get-window-position', () => this.getWindowPosition())
     ipcMain.handle('get-window-material', () => this.getWindowMaterial())
     ipcMain.on('set-window-position', (_event, x: number, y: number) =>
@@ -36,11 +37,17 @@ export class WindowAPI {
         const [, height] = this.mainWindow.getSize()
         this.lockedSize = { width: WINDOW_WIDTH, height }
       } else {
-        // 解锁：验证并恢复尺寸
+        // 解锁：验证并恢复尺寸（用 setBounds 保留位置，避免 Windows 下 x 轴偏移）
         if (this.lockedSize) {
+          const [currentX, currentY] = this.mainWindow.getPosition()
           const [, height] = this.mainWindow.getSize()
           if (WINDOW_WIDTH !== this.lockedSize.width || height !== this.lockedSize.height) {
-            this.mainWindow.setSize(this.lockedSize.width, this.lockedSize.height)
+            this.mainWindow.setBounds({
+              x: currentX,
+              y: currentY,
+              width: this.lockedSize.width,
+              height: this.lockedSize.height
+            })
           }
           this.lockedSize = null
         }
@@ -89,9 +96,13 @@ export class WindowAPI {
       const maxHeight = display.workAreaSize.height
       const newHeight = Math.max(WINDOW_INITIAL_HEIGHT, Math.min(height, maxHeight))
 
+      // 保留当前 x/y 位置：Windows 下 setSize 会导致窗口向左偏移（DPI 缩放/阴影帧影响）
+      const [currentX, currentY] = this.mainWindow.getPosition()
+
       // 临时启用 resizable 以允许代码调整大小
       this.mainWindow.setResizable(true)
-      this.mainWindow.setSize(width, newHeight)
+      // 使用 setBounds 代替 setSize，确保只改高度不改位置
+      this.mainWindow.setBounds({ x: currentX, y: currentY, width, height: newHeight })
       // 立即禁用 resizable，防止用户手动调整
       this.mainWindow.setResizable(false)
 
@@ -125,7 +136,7 @@ export class WindowAPI {
     }
   }
 
-  private setWindowOpacity(opacity: number): void {
+  public setWindowOpacity(opacity: number): void {
     if (this.mainWindow) {
       const clampedOpacity = Math.max(0.3, Math.min(1, opacity))
       this.mainWindow.setOpacity(clampedOpacity)
@@ -133,7 +144,7 @@ export class WindowAPI {
     }
   }
 
-  private setTrayIconVisible(visible: boolean): void {
+  public setTrayIconVisible(visible: boolean): void {
     windowManager.setTrayIconVisible(visible)
     console.log('[WindowAPI] 设置托盘图标可见性:', visible)
   }
@@ -152,6 +163,13 @@ export class WindowAPI {
   private openSettings(): void {
     windowManager.showSettings()
     console.log('[WindowAPI] 打开设置插件')
+  }
+
+  /**
+   * 更新主窗口当前输入上下文，供应用快捷键启动时复用
+   */
+  private updateLaunchContext(context: any): void {
+    windowManager.updateAppShortcutLaunchContext(context || {})
   }
 
   public async updateAutoBackToSearch(autoBackToSearch: string): Promise<void> {

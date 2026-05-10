@@ -35,6 +35,12 @@ declare global {
       launchAsAdmin: (appPath: string, name?: string) => Promise<void>
       hideWindow: () => void
       resizeWindow: (height: number) => void
+      updateLaunchContext: (context: {
+        searchQuery: string
+        pastedImage: string | null
+        pastedFiles: Array<{ path: string; name: string; isDirectory: boolean }> | null
+        pastedText: string | null
+      }) => void
       getWindowPosition: () => Promise<{ x: number; y: number }>
       setWindowPosition: (x: number, y: number) => void
       setWindowSizeLock: (lock: boolean) => void
@@ -68,8 +74,15 @@ declare global {
       showContextMenu: (menuItems: any[]) => Promise<void>
       getPlugins: () => Promise<any[]>
       getAllPlugins: () => Promise<any[]>
+      getDisabledPlugins: () => Promise<string[]>
+      setPluginDisabled: (
+        pluginPath: string,
+        disabled: boolean
+      ) => Promise<{ success: boolean; error?: string }>
       importPlugin: () => Promise<{ success: boolean; error?: string }>
-      importDevPlugin: () => Promise<{ success: boolean; error?: string }>
+      // 导入开发中的插件工程，可选直接传入 plugin.json 路径
+      importDevPlugin: (pluginJsonPath?: string) => Promise<{ success: boolean; error?: string }>
+      removeDevProject: (pluginName: string) => Promise<{ success: boolean; error?: string }>
       fetchPluginMarket: () => Promise<{
         success: boolean
         data?: any
@@ -100,7 +113,6 @@ declare global {
         error?: string
       }>
       deletePlugin: (pluginPath: string) => Promise<{ success: boolean; error?: string }>
-      reloadPlugin: (pluginPath: string) => Promise<{ success: boolean; error?: string }>
       getRunningPlugins: () => Promise<string[]>
       killPlugin: (pluginPath: string) => Promise<{ success: boolean; error?: string }>
       killPluginAndReturn: (pluginPath: string) => Promise<{ success: boolean; error?: string }>
@@ -163,6 +175,8 @@ declare global {
       onPluginClosed: (callback: () => void) => void
       onPluginsChanged: (callback: () => void) => void
       onAppsChanged: (callback: () => void) => void
+      onLocalShortcutsChanged: (callback: () => void) => void
+      onCommandAliasesChanged: (callback: () => void) => void
       onHistoryChanged: (callback: () => void) => void
       onPinnedChanged: (callback: () => void) => void
       onSuperPanelPinnedChanged: (callback: () => void) => void
@@ -203,6 +217,8 @@ declare global {
         success: boolean
         data?: Array<{
           pluginName: string
+          pluginTitle?: string | null
+          isDevelopment: boolean
           docCount: number
           attachmentCount: number
           logo: string | null
@@ -261,6 +277,7 @@ declare global {
       onUpdateRecentRows: (callback: (rows: number) => void) => void
       onUpdatePinnedRows: (callback: (rows: number) => void) => void
       onUpdateTabTarget: (callback: (target: string) => void) => void
+      onUpdateTabKeyFunction: (callback: (mode: 'navigate' | 'target-command') => void) => void
       onUpdateSpaceOpenCommand: (callback: (enabled: boolean) => void) => void
       onUpdateFloatingBallDoubleClickCommand?: (callback: (command: string) => void) => void
       onUpdateSearchMode: (callback: (mode: string) => void) => void

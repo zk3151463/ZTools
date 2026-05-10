@@ -14,16 +14,15 @@ const { success, error, warning, info, confirm } = useToast()
 
 // 插件相关状态
 const plugins = ref<any[]>([])
+const disabledPluginPaths = ref<string[]>([])
 const runningPlugins = ref<string[]>([])
 const isLoading = ref(true)
 const isImporting = ref(false)
-const isImportingDev = ref(false)
 const isImportingNpm = ref(false)
 const isDeleting = ref(false)
 const isKilling = ref(false)
 const isKillingAll = ref(false)
-const isReloading = ref(false)
-const isPackaging = ref(false)
+const isExportingAll = ref(false)
 // 是否正在执行“全部更新”
 const isUpgradingAll = ref(false)
 // “全部更新”当前完成数（用于进度展示）
@@ -100,6 +99,10 @@ function isPluginPinned(pluginPath: string): boolean {
   return pinnedPluginPaths.value.includes(pluginPath)
 }
 
+function isPluginDisabled(pluginPath: string): boolean {
+  return disabledPluginPaths.value.includes(pluginPath)
+}
+
 async function togglePin(plugin: any): Promise<void> {
   const path = plugin.path
   const idx = pinnedPluginPaths.value.indexOf(path)
@@ -121,7 +124,11 @@ async function togglePin(plugin: any): Promise<void> {
 async function loadPlugins(): Promise<void> {
   isLoading.value = true
   try {
-    const installedPlugins = await window.ztools.internal.getPlugins()
+    const [installedPlugins, disabledPlugins] = await Promise.all([
+      window.ztools.internal.getPlugins(),
+      window.ztools.internal.getDisabledPlugins()
+    ])
+    disabledPluginPaths.value = disabledPlugins
     plugins.value = buildPluginList(installedPlugins)
     await loadRunningPlugins()
   } catch (err) {
@@ -311,54 +318,6 @@ async function importPlugin(): Promise<void> {
   }
 }
 
-// 添加开发中插件
-async function importDevPlugin(): Promise<void> {
-  if (isImportingDev.value) return
-
-  isImportingDev.value = true
-  try {
-    const result = await window.ztools.internal.importDevPlugin()
-    if (result.success) {
-      // 重新加载插件列表
-      await loadPlugins()
-      // 关闭更多菜单
-      showMoreMenu.value = false
-      success('开发中插件添加成功!')
-    } else {
-      error(`添加开发中插件失败: ${result.error}`)
-    }
-  } catch (err: any) {
-    console.error('添加开发中插件失败:', err)
-    error(`添加开发中插件失败: ${err.message || '未知错误'}`)
-  } finally {
-    isImportingDev.value = false
-  }
-}
-
-// 自动添加开发插件（从文件路径）
-async function addDevPluginByFilePath(devPluginFilePath: string): Promise<void> {
-  const filePath = devPluginFilePath
-  if (!filePath || isImportingDev.value) return
-
-  isImportingDev.value = true
-  try {
-    const result = await window.ztools.internal.importDevPlugin(filePath)
-    if (result.success) {
-      // 重新加载插件列表
-      await loadPlugins()
-      success('开发中插件添加成功!')
-    } else {
-      error(`添加开发中插件失败: ${result.error}`)
-    }
-  } catch (err: any) {
-    console.error('添加开发中插件失败:', err)
-    error(`添加开发中插件失败: ${err.message || '未知错误'}`)
-  } finally {
-    isImportingDev.value = false
-    // emit('add-dev-consumed')
-  }
-}
-
 // 从详情页面卸载插件（确认弹窗在 PluginDetail 中已展示，此处直接执行删除）
 async function handleUninstallFromDetail(plugin: any): Promise<void> {
   if (isDeleting.value) return
@@ -466,6 +425,11 @@ async function handleKillAllPlugins(): Promise<void> {
 
 // 打开插件
 async function handleOpenPlugin(plugin: any): Promise<void> {
+  if (isPluginDisabled(plugin.path)) {
+    warning('插件已禁用，请先在设置中启用')
+    return
+  }
+
   try {
     const result = await window.ztools.internal.launch({
       path: plugin.path,
@@ -494,72 +458,55 @@ async function handleOpenFolder(plugin: any): Promise<void> {
   }
 }
 
-// 重载插件
-async function handleReloadPlugin(plugin: any): Promise<void> {
-  if (isReloading.value) return
-
-  isReloading.value = true
+async function handleTogglePluginDisabled(plugin: any, disabled: boolean): Promise<void> {
   try {
-    const result = await window.ztools.internal.reloadPlugin(plugin.path)
-    if (result.success) {
-      // 重新加载插件列表
-      await loadPlugins()
-      // 注意：插件重载后，主程序会自动刷新指令列表
-      success('插件重载成功!')
-    } else {
-      error(`插件重载失败: ${result.error}`)
+    const result = await window.ztools.internal.setPluginDisabled(plugin.path, disabled)
+    if (!result.success) {
+      error(`更新插件状态失败: ${result.error || '未知错误'}`)
+      return
     }
+
+    await loadPlugins()
+    const updated = plugins.value.find((p) => p.path === plugin.path)
+    if (updated && selectedPlugin.value?.path === plugin.path) {
+      selectedPlugin.value = updated
+    }
+
+    success(disabled ? '插件已禁用' : '插件已启用')
   } catch (err: any) {
-    console.error('重载插件失败:', err)
-    error(`重载插件失败: ${err.message || '未知错误'}`)
-  } finally {
-    isReloading.value = false
+    console.error('更新插件禁用状态失败:', err)
+    error(`更新插件状态失败: ${err.message || '未知错误'}`)
   }
 }
 
-// 从详情页面重载插件（重载后刷新 selectedPlugin）
-async function handleReloadPluginFromDetail(plugin: any): Promise<void> {
-  if (isReloading.value) return
+// 导出全部插件到下载目录
+async function handleExportAllPlugins(): Promise<void> {
+  if (isExportingAll.value) return
 
-  isReloading.value = true
+  const confirmed = await confirm({
+    title: '导出全部插件',
+    message: '将导出全部已安装插件（不含开发中插件），是否继续？',
+    type: 'info',
+    confirmText: '导出',
+    cancelText: '取消'
+  })
+  if (!confirmed) return
+
+  isExportingAll.value = true
+  showMoreMenu.value = false
+
   try {
-    const result = await window.ztools.internal.reloadPlugin(plugin.path)
+    const result = await window.ztools.internal.exportAllPlugins()
     if (result.success) {
-      await loadPlugins()
-      // 更新 selectedPlugin 引用
-      const updated = plugins.value.find((p) => p.path === plugin.path)
-      if (updated) {
-        selectedPlugin.value = updated
-      }
-      success('插件重载成功!')
+      success(`导出成功，共 ${result.count} 个插件`)
     } else {
-      error(`插件重载失败: ${result.error}`)
+      error(`导出失败: ${result.error}`)
     }
   } catch (err: any) {
-    console.error('重载插件失败:', err)
-    error(`重载插件失败: ${err.message || '未知错误'}`)
+    console.error('导出插件失败:', err)
+    error(`导出失败: ${err.message || '未知错误'}`)
   } finally {
-    isReloading.value = false
-  }
-}
-
-// 打包插件
-async function handlePackagePlugin(plugin: any): Promise<void> {
-  if (isPackaging.value) return
-
-  isPackaging.value = true
-  try {
-    const result = await window.ztools.internal.packagePlugin(plugin.path)
-    if (result.success) {
-      success('插件打包成功!')
-    } else if (result.error !== '已取消') {
-      error(`插件打包失败: ${result.error}`)
-    }
-  } catch (err: any) {
-    console.error('打包插件失败:', err)
-    error(`打包插件失败: ${err.message || '未知错误'}`)
-  } finally {
-    isPackaging.value = false
+    isExportingAll.value = false
   }
 }
 
@@ -604,10 +551,8 @@ onMounted(async () => {
 // 处理对应 ztools code 进来的功能
 useJumpFunction((state) => {
   void loadRunningPlugins()
-  if (state.localAddDevPluginFilePath) {
-    void addDevPluginByFilePath(state.localAddDevPluginFilePath)
-  } else if (state.payload) {
-    void openPluginByName(state.payload)
+  if (state.payload) {
+    void openPluginByPayload(state.payload)
   }
 })
 
@@ -617,8 +562,8 @@ onUnmounted(() => {
 })
 
 // 打开指定插件名称的详情
-async function openPluginByName(pluginName: string): Promise<void> {
-  if (!pluginName) return
+async function openPluginByPayload(payload: string): Promise<void> {
+  if (!payload) return
 
   // 如果插件列表还没加载完，等待加载完成
   if (plugins.value.length === 0 && isLoading.value) {
@@ -632,7 +577,15 @@ async function openPluginByName(pluginName: string): Promise<void> {
     })
   }
 
-  const plugin = plugins.value.find((p) => p.name === pluginName)
+  let pluginName = payload
+  try {
+    const parsed = JSON.parse(payload)
+    pluginName = typeof parsed === 'string' ? parsed : (parsed?.pluginName ?? payload)
+  } catch {
+    // payload is a plain string
+  }
+
+  const plugin = plugins.value.find((candidate) => candidate.name === pluginName)
   if (plugin) {
     openPluginDetail(plugin)
   }
@@ -758,22 +711,6 @@ async function handleInstallFromNpm(data: {
                 </svg>
               </button>
               <div v-if="showMoreMenu" class="more-menu" @click="closeMoreMenu">
-                <button class="more-menu-item" :disabled="isImportingDev" @click="importDevPlugin">
-                  <svg
-                    xmlns="http://www.w3.org/2000/svg"
-                    width="16"
-                    height="16"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                  >
-                    <path d="M12 5v14M5 12h14"></path>
-                  </svg>
-                  {{ isImportingDev ? '添加中...' : '添加开发中插件' }}
-                </button>
                 <button
                   class="more-menu-item"
                   :disabled="isImportingNpm"
@@ -810,6 +747,28 @@ async function handleInstallFromNpm(data: {
                   }}
                 </button>
                 <button
+                  class="more-menu-item"
+                  :disabled="isExportingAll"
+                  @click="handleExportAllPlugins"
+                >
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                    <polyline points="17 8 12 3 7 8"></polyline>
+                    <line x1="12" y1="3" x2="12" y2="15"></line>
+                  </svg>
+                  {{ isExportingAll ? '导出中...' : '导出全部插件' }}
+                </button>
+                <button
                   class="more-menu-item kill-all-item"
                   :disabled="isKillingAll || runningPluginsCount === 0"
                   @click="handleKillAllPlugins"
@@ -843,20 +802,23 @@ async function handleInstallFromNpm(data: {
             :title="plugin.description"
             @click="openPluginDetail(plugin)"
           >
-            <AdaptiveIcon
-              v-if="plugin.logo"
-              :src="plugin.logo"
-              class="plugin-icon"
-              alt="插件图标"
-              draggable="false"
-            />
-            <div v-else class="plugin-icon-placeholder">🧩</div>
+            <div class="plugin-icon-wrapper">
+              <AdaptiveIcon
+                v-if="plugin.logo"
+                :src="plugin.logo"
+                class="plugin-icon"
+                alt="插件图标"
+                draggable="false"
+              />
+              <div v-else class="plugin-icon-placeholder">🧩</div>
+              <span v-if="plugin.isDevelopment" class="plugin-dev-badge">DEV</span>
+            </div>
 
             <div class="plugin-info">
               <div class="plugin-name">
                 {{ plugin.title || plugin.name }}
                 <span class="plugin-version">v{{ plugin.version }}</span>
-                <span v-if="plugin.isDevelopment" class="dev-badge">开发中</span>
+                <span v-if="isPluginDisabled(plugin.path)" class="disabled-badge">已禁用</span>
                 <span v-if="isPluginRunning(plugin.path)" class="running-badge">
                   <span class="status-dot"></span>
                   运行中
@@ -868,6 +830,7 @@ async function handleInstallFromNpm(data: {
             <div class="plugin-meta">
               <button
                 class="icon-btn open-btn"
+                :disabled="isPluginDisabled(plugin.path)"
                 title="打开插件"
                 @click.stop="handleOpenPlugin(plugin)"
               >
@@ -928,30 +891,6 @@ async function handleInstallFromNpm(data: {
                 </svg>
               </button>
               <button
-                class="icon-btn reload-btn"
-                :disabled="isReloading"
-                title="重新加载 plugin.json 配置文件"
-                @click.stop="handleReloadPlugin(plugin)"
-              >
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  width="14"
-                  height="14"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                >
-                  <polyline points="23 4 23 10 17 10"></polyline>
-                  <polyline points="1 20 1 14 7 14"></polyline>
-                  <path
-                    d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"
-                  ></path>
-                </svg>
-              </button>
-              <button
                 class="icon-btn pin-btn"
                 :class="{ 'is-pinned': isPluginPinned(plugin.path) }"
                 :title="isPluginPinned(plugin.path) ? '取消置顶' : '置顶'"
@@ -1003,14 +942,14 @@ async function handleInstallFromNpm(data: {
         :plugin="selectedPlugin"
         :is-running="isPluginRunning(selectedPlugin.path)"
         :is-pinned="isPluginPinned(selectedPlugin.path)"
+        :is-disabled="isPluginDisabled(selectedPlugin.path)"
         @back="closePluginDetail"
         @open="handleOpenPlugin(selectedPlugin)"
         @uninstall="handleUninstallFromDetail(selectedPlugin)"
         @kill="handleKillPlugin(selectedPlugin)"
         @open-folder="handleOpenFolder(selectedPlugin)"
-        @package="handlePackagePlugin(selectedPlugin)"
-        @reload="handleReloadPluginFromDetail(selectedPlugin)"
         @toggle-pin="togglePin(selectedPlugin)"
+        @toggle-disabled="handleTogglePluginDisabled(selectedPlugin, $event)"
       />
     </Transition>
 
@@ -1166,7 +1105,6 @@ async function handleInstallFromNpm(data: {
   width: 40px;
   height: 40px;
   border-radius: 6px;
-  margin-right: 12px;
   flex-shrink: 0;
 }
 
@@ -1207,14 +1145,44 @@ async function handleInstallFromNpm(data: {
 }
 
 .dev-badge {
+  display: none;
+}
+
+.plugin-icon-wrapper {
+  position: relative;
+  flex-shrink: 0;
+  margin-right: 12px;
+  width: 40px;
+  height: 40px;
+}
+
+.plugin-dev-badge {
+  position: absolute;
+  right: -4px;
+  bottom: -4px;
+  display: inline-flex;
+  min-width: 18px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--bg-color);
+  border-radius: 999px;
+  background: #389e0d;
+  color: var(--text-on-primary);
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 2px 4px;
+}
+
+.disabled-badge {
   display: inline-block;
   font-size: 11px;
   font-weight: 500;
-  color: var(--purple-color);
-  background: var(--purple-light-bg);
+  color: var(--warning-color);
+  background: color-mix(in srgb, var(--warning-color) 12%, transparent);
   padding: 2px 8px;
   border-radius: 4px;
-  border: 1px solid var(--purple-border);
+  border: 1px solid color-mix(in srgb, var(--warning-color) 35%, transparent);
 }
 
 .running-badge {
@@ -1285,14 +1253,6 @@ async function handleInstallFromNpm(data: {
 }
 
 .folder-btn:hover {
-  background: var(--primary-light-bg);
-}
-
-.reload-btn {
-  color: var(--primary-color);
-}
-
-.reload-btn:hover:not(:disabled) {
   background: var(--primary-light-bg);
 }
 

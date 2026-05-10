@@ -1,4 +1,4 @@
-import { BrowserWindow, session, WebContents, WebContentsView } from 'electron'
+import { BrowserWindow, session, shell, WebContents, WebContentsView } from 'electron'
 import fsSync from 'fs'
 import path from 'path'
 import { pathToFileURL } from 'url'
@@ -9,11 +9,12 @@ import api from '../api'
 import { WINDOW_INITIAL_HEIGHT, WINDOW_DEFAULT_HEIGHT, WINDOW_WIDTH } from '../common/constants'
 import detachedWindowManager, { DETACHED_TITLEBAR_HEIGHT } from '../core/detachedWindowManager'
 import { GLOBAL_SCROLLBAR_CSS } from '../core/globalStyles'
-import { isInternalPlugin } from '../core/internalPlugins'
+import { canPluginUseInternalApi, isBundledInternalPlugin } from '../core/internalPlugins'
 import { getInternalPluginUrl, getInternalPluginServerPort } from '../core/internalPluginServer'
 import pluginWindowManager from '../core/pluginWindowManager'
 import { registerIconProtocolForSession } from '../core/iconProtocol'
 import lmdbInstance from '../core/lmdb/lmdbInstance'
+import databaseAPI from '../api/shared/database'
 import proxyManager from './proxyManager'
 import {
   EnterPayload,
@@ -22,8 +23,54 @@ import {
 } from './pluginAssemblyCoordinator'
 import devToolsShortcut, { getDevToolsMode } from '../utils/devToolsShortcut'
 import windowManager from './windowManager'
+import {
+  getDetachedWindowSizeKey,
+  getPluginDataPrefix,
+  getPluginSessionPartition
+} from '../../shared/pluginRuntimeNamespace'
 
 console.log('[Plugin] mainPreload', mainPreload)
+
+/**
+ * 为插件视图注册外部链接拦截器
+ * 同源 http/https 导航保留在插件内部，跨源链接使用系统默认浏览器打开，避免开发中插件热更新导致错误地在浏览器打开
+ */
+export function registerExternalLinkInterceptor(webContents: WebContents): void {
+  const isHttpUrl = (url: string): boolean =>
+    url.startsWith('http://') || url.startsWith('https://')
+
+  const isSameHttpOrigin = (currentUrl: string, targetUrl: string): boolean => {
+    if (!isHttpUrl(currentUrl) || !isHttpUrl(targetUrl)) return false
+
+    try {
+      return new URL(currentUrl).origin === new URL(targetUrl).origin
+    } catch {
+      return false
+    }
+  }
+
+  // 拦截插件内部的页面跳转（如 <a href="..."> 点击）
+  webContents.on('will-navigate', (event, url) => {
+    const currentUrl = webContents.getURL()
+    if (isHttpUrl(url) && !isSameHttpOrigin(currentUrl, url)) {
+      event.preventDefault()
+      console.log('[Plugin] 拦截跨源页面跳转，使用默认浏览器打开:', {
+        from: currentUrl,
+        to: url
+      })
+      shell.openExternal(url)
+    }
+  })
+
+  // 拦截 target="_blank" 或 window.open 打开的链接，统一交给系统默认浏览器
+  webContents.setWindowOpenHandler(({ url }) => {
+    if (isHttpUrl(url)) {
+      console.log('[Plugin] 拦截新窗口打开，使用默认浏览器打开:', url)
+      shell.openExternal(url)
+    }
+    return { action: 'deny' }
+  })
+}
 
 interface PluginViewInfo {
   path: string
@@ -82,9 +129,10 @@ export class PluginManager {
       if (staticFeature?.mainHide === true) return true
 
       // 2. 检查数据库中的动态 features
-      const pluginName = pluginConfig.name
-      if (pluginName) {
-        const doc = lmdbInstance.get(`PLUGIN/${pluginName}/dynamic-features`)
+      const pluginInfoFromDB = this.fetchPluginInfoFromDB(pluginPath)
+      const effectiveName = pluginInfoFromDB?.name || pluginConfig.name
+      if (effectiveName) {
+        const doc = lmdbInstance.get(`${getPluginDataPrefix(effectiveName)}dynamic-features`)
         if (doc?.data) {
           const dynamicFeatures = JSON.parse(doc.data).features || []
           const dynamicFeature = dynamicFeatures.find((f: any) => f.code === featureCode)
@@ -143,7 +191,7 @@ export class PluginManager {
       return { pluginUrl: pluginConfig.main, isConfigHeadless }
     }
     // 生产环境内置插件：使用本地 HTTP server 加载（避免 file:// 下的 CSP 限制）
-    if (isInternalPlugin(pluginConfig.name) && getInternalPluginServerPort() > 0) {
+    if (isBundledInternalPlugin(pluginConfig.name) && getInternalPluginServerPort() > 0) {
       const httpUrl = getInternalPluginUrl(pluginConfig.name, pluginConfig.main)
       console.log('[Plugin] 内置插件使用 HTTP server:', httpUrl)
       return { pluginUrl: httpUrl, isConfigHeadless }
@@ -157,11 +205,20 @@ export class PluginManager {
   /**
    * 创建并配置插件的 session（注册 preload、代理、图标协议）
    */
-  private async setupPluginSession(pluginName: string): Promise<Electron.Session> {
-    const sess = session.fromPartition('persist:' + pluginName)
+  private async setupPluginSession(
+    pluginName: string,
+    pluginPath: string
+  ): Promise<Electron.Session> {
+    const partition = getPluginSessionPartition(pluginName)
+    console.log('[Plugin] 设置插件 Session:', {
+      pluginName,
+      pluginPath,
+      partition
+    })
+    const sess = session.fromPartition(partition)
     sess.registerPreloadScript({ type: 'frame', filePath: mainPreload })
     await proxyManager.applyProxyToSession(sess, `插件 ${pluginName}`)
-    if (isInternalPlugin(pluginName)) {
+    if (isBundledInternalPlugin(pluginName)) {
       registerIconProtocolForSession(sess)
     }
     return sess
@@ -456,16 +513,31 @@ export class PluginManager {
       featureCode
     })
 
-    this.pluginView = cached.view
-    this.mainWindow.contentView.addChildView(this.pluginView)
+    // 使用局部变量持有视图引用。
+    // 关键：延迟设置 this.pluginView，直到所有 async 操作完成。
+    // 这样在 await 期间若 hidePluginView() 被竞态调用（focus-search → hidePlugin IPC），
+    // 因 this.pluginView 仍为 null，守卫条件不通过，装配会话不会被误中断。
+    const view = cached.view
+    this.mainWindow.contentView.addChildView(view)
 
     // 恢复显示时关闭节流
-    this.applyBackgroundThrottlingByPolicy(this.pluginView, pluginPath, false)
+    this.applyBackgroundThrottlingByPolicy(view, pluginPath, false)
 
-    const mode = await this.getPluginMode(this.pluginView.webContents, featureCode)
+    const mode = await this.getPluginMode(view.webContents, featureCode)
+
+    // await 之后检查装配会话是否仍然有效
+    if (assembly && !this.assemblyCoordinator.isActiveSession(assembly)) {
+      console.log('[Plugin] 装配会话在 getPluginMode 期间被中断，跳过后续恢复:', pluginPath)
+      this.mainWindow.contentView.removeChildView(view)
+      return
+    }
+
+    // === 所有 async 操作完成，提交状态 ===
+    this.pluginView = view
+    this.currentPluginPath = pluginPath
 
     console.log('[Plugin] 插件视图获取焦点')
-    this.pluginView.webContents.focus()
+    view.webContents.focus()
 
     // 恢复之前的高度或使用默认高度
     const isConfigHeadless = !pluginInfoFromDB?.main
@@ -480,8 +552,6 @@ export class PluginManager {
     } else {
       this.setExpendHeight(cached.height || this.pluginDefaultHeight, false)
     }
-
-    this.currentPluginPath = pluginPath
 
     // 读取插件配置并通知渲染进程
     try {
@@ -507,12 +577,12 @@ export class PluginManager {
       pluginPath,
       featureCode
     })
-    await this.processPluginMode(pluginPath, featureCode, this.pluginView, assembly, mode)
+    await this.processPluginMode(pluginPath, featureCode, view, assembly, mode)
 
     // 修复部分 Windows 系统重新挂载 WebContentsView 后白屏问题：
     // removeChildView/addChildView 后某些 GPU 驱动下 compositor 不重绘 surface，
     // 通过 bounds 微调 (+1px/-1px) 强制 compositor 重新合成
-    this.forceRepaintView(cached.view)
+    this.forceRepaintView(view)
   }
 
   /**
@@ -537,13 +607,14 @@ export class PluginManager {
       api.resizeWindow(WINDOW_INITIAL_HEIGHT + 1)
       const pluginConfig = this.readPluginConfig(pluginPath)
       const isDevelopment = !!pluginInfoFromDB?.isDevelopment
+      const effectiveName = pluginInfoFromDB?.name || pluginConfig.name
       const { pluginUrl } = this.resolvePluginUrl(pluginPath, pluginConfig, isDevelopment)
 
       const preloadPath = pluginConfig.preload
         ? path.join(pluginPath, pluginConfig.preload)
         : undefined
 
-      const sess = await this.setupPluginSession(pluginConfig.name)
+      const sess = await this.setupPluginSession(effectiveName, pluginPath)
       this.pluginView = this.createPluginWebContentsView(sess, preloadPath)
 
       // 注册主窗口专属的事件监听
@@ -560,7 +631,7 @@ export class PluginManager {
       const logoUrl = this.buildPluginLogoUrl(pluginPath, pluginConfig.logo)
       const pluginInfo: PluginViewInfo = {
         path: pluginPath,
-        name: pluginConfig.name,
+        name: effectiveName,
         view: this.pluginView,
         subInputPlaceholder: '搜索',
         subInputVisible: false,
@@ -601,7 +672,9 @@ export class PluginManager {
 
         view.webContents.insertCSS(GLOBAL_SCROLLBAR_CSS)
         await this.processPluginMode(pluginPath, featureCode, view, assembly)
-        this.sendPluginLoadedEvent(pluginConfig.name, pluginPath)
+        this.sendPluginLoadedEvent(effectiveName, pluginPath)
+        // 修复 Windows 首次进入插件时的白屏：新建视图同样需要触发重绘
+        this.forceRepaintView(view)
         this.assemblyCoordinator.trace('create-new-view-dom-ready-finish', {
           assemblyId: assembly?.id,
           pluginPath,
@@ -613,7 +686,8 @@ export class PluginManager {
       this.assemblyCoordinator.trace('create-new-view-finish', {
         assemblyId: assembly?.id,
         pluginPath,
-        featureCode
+        featureCode,
+        effectiveName
       })
     } catch (error) {
       console.error('[Plugin] 加载插件配置失败:', error)
@@ -663,6 +737,12 @@ export class PluginManager {
         (input.key === 'q' || input.key === 'Q') &&
         (input.meta || input.control)
       ) {
+        const settings = databaseAPI.dbGet('settings-general') || {}
+        const isEnabled = settings?.builtinAppShortcutsEnabled?.killPlugin !== false
+        if (!isEnabled) {
+          // 禁用时不拦截，让按键正常传到渲染进程（供 HotkeyInput 录制）
+          return
+        }
         event.preventDefault()
         console.log('[Plugin] 插件视图检测到 Cmd+Q 快捷键，终止插件')
         this.killCurrentPlugin()
@@ -699,6 +779,9 @@ export class PluginManager {
 
       pluginWindowManager.closeByPlugin(pluginPath)
     })
+
+    // 拦截外部链接跳转，使用系统默认浏览器打开
+    registerExternalLinkInterceptor(view.webContents)
   }
 
   // 发送消息到插件
@@ -757,14 +840,28 @@ export class PluginManager {
   private checkAndKillPlugin(pluginName: string, pluginPath: string): void {
     try {
       const data = api.dbGet('outKillPlugin')
-      if (data && Array.isArray(data) && data.includes(pluginName)) {
+      if (Array.isArray(data) && data.includes(pluginName)) {
         console.log(`插件 ${pluginName} 配置为退出后立即结束，销毁 view`)
         this.killPlugin(pluginPath)
       }
     } catch (error) {
-      // 配置不存在或读取失败，保持默认行为（不销毁）
       console.log('[Plugin] 读取 outKillPlugin 配置失败:', error)
     }
+  }
+
+  /**
+   * 主窗口渲染进程刷新时，仅将当前插件视图从 contentView 移除（不发送生命周期事件、不销毁）。
+   * 避免渲染进程状态重置后与插件视图产生叠层问题。
+   */
+  public detachPluginViewOnRefresh(): void {
+    if (!this.pluginView || !this.mainWindow) return
+    const pluginView = this.pluginView
+    console.log('[Plugin] 检测到主渲染进程刷新，移除当前插件视图以防叠层:', this.currentPluginPath)
+    this.mainWindow.contentView.removeChildView(pluginView)
+    this.pluginView = null
+    this.currentPluginPath = null
+    this.assemblyCoordinator.abortCurrentSession('renderer-refresh-abort-assembly')
+    this.assemblyCoordinator.clearCurrentSession()
   }
 
   // 获取当前加载的插件路径
@@ -777,11 +874,53 @@ export class PluginManager {
     return this.pluginView
   }
 
+  /**
+   * 在主窗口显示时按需恢复当前插件视图高度。
+   * mainHide feature 在启动阶段会先把高度压成 0，后续若通过 showWindow 唤起主窗口，
+   * 需要把插件视图恢复到缓存高度或默认高度。
+   */
+  public restoreCurrentPluginViewHeightOnWindowShow(): void {
+    if (!this.mainWindow || !this.pluginView || !this.currentPluginPath) {
+      return
+    }
+
+    const lastState = this.pluginLastEnterState.get(this.currentPluginPath)
+    if (!lastState) return
+
+    if (!this.isFeatureMainHide(this.currentPluginPath, lastState.featureCode)) {
+      return
+    }
+
+    const bounds = this.pluginView.getBounds()
+    if (bounds.height > 0) {
+      return
+    }
+
+    const cached = this.pluginViews.find((v) => v.path === this.currentPluginPath)
+    const targetHeight =
+      cached?.height && cached.height > 0 ? cached.height : this.pluginDefaultHeight
+
+    console.log('[Plugin] showWindow 时恢复 mainHide 插件高度:', targetHeight)
+    this.setExpendHeight(targetHeight, true)
+    this.forceRepaintView(this.pluginView)
+  }
+
   public focusPluginView(): void {
     if (this.pluginView && this.pluginView.webContents) {
       console.log('[Plugin] 插件视图获取焦点')
       this.pluginView.webContents.focus()
     }
+  }
+
+  /**
+   * 检查插件 WebContentsView 是否当前北有焦点
+   * 供 Linux blur 事件处理器判断是否是应用内部焦点转移
+   */
+  public isPluginViewFocused(): boolean {
+    if (!this.pluginView || this.pluginView.webContents.isDestroyed()) {
+      return false
+    }
+    return this.pluginView.webContents.isFocused()
   }
 
   /**
@@ -803,13 +942,14 @@ export class PluginManager {
       const pluginInfoFromDB = this.fetchPluginInfoFromDB(pluginPath)
       const pluginConfig = this.readPluginConfig(pluginPath)
       const isDevelopment = !!pluginInfoFromDB?.isDevelopment
+      const effectiveName = pluginInfoFromDB?.name || pluginConfig.name
       const { pluginUrl } = this.resolvePluginUrl(pluginPath, pluginConfig, isDevelopment)
 
       const preloadPath = pluginConfig.preload
         ? path.join(pluginPath, pluginConfig.preload)
         : undefined
 
-      const sess = await this.setupPluginSession(pluginConfig.name)
+      const sess = await this.setupPluginSession(effectiveName, pluginPath)
       const view = this.createPluginWebContentsView(sess, preloadPath)
 
       // 注册事件监听
@@ -819,7 +959,7 @@ export class PluginManager {
       const logoUrl = this.buildPluginLogoUrl(pluginPath, pluginConfig.logo)
       const pluginInfo: PluginViewInfo = {
         path: pluginPath,
-        name: pluginConfig.name,
+        name: effectiveName,
         view,
         subInputPlaceholder: '搜索',
         subInputVisible: false,
@@ -840,13 +980,16 @@ export class PluginManager {
         this.assemblyCoordinator.markDomReady(view.webContents.id)
         view.webContents.insertCSS(GLOBAL_SCROLLBAR_CSS)
         console.log('[Plugin] 后台预加载插件完成:', {
-          pluginName: pluginConfig.name,
+          pluginName: effectiveName,
           pluginPath,
           webContentsId: view.webContents.id
         })
       })
 
-      console.log('[Plugin] 后台预加载插件:', pluginConfig.name)
+      console.log('[Plugin] 后台预加载插件:', {
+        pluginName: effectiveName,
+        pluginPath
+      })
     } catch (error) {
       console.error('[Plugin] 后台预加载插件失败:', pluginPath, error)
     }
@@ -1074,14 +1217,24 @@ export class PluginManager {
 
   /**
    * 强制重绘 WebContentsView（修复部分 Windows 系统白屏问题）
-   * 通过 bounds 微调迫使 Chromium compositor 重新合成 surface
+   * 通过 bounds 微调迫使 Chromium compositor 重新合成 surface。
+   *
+   * 关键：两次 setBounds 必须跨 event loop tick 执行。
+   * 若在同一 tick 内同步调用，Chromium compositor 会合并两次操作，
+   * 只取最终值在下次 vsync 渲染，+1px 中间状态从未触达 GPU 合成阶段，修复失效。
+   * 用 setImmediate 将第二次调用推入下一 tick，使两次变化各自落在不同 vsync 周期，
+   * 从而确保第一次 +1px 真正触发 compositor 重绘。
    */
   private forceRepaintView(view: WebContentsView): void {
     if (view.webContents.isDestroyed()) return
     const bounds = view.getBounds()
     if (bounds.height <= 0) return
     view.setBounds({ ...bounds, height: bounds.height + 1 })
-    view.setBounds(bounds)
+    setImmediate(() => {
+      if (!view.webContents.isDestroyed()) {
+        view.setBounds(bounds)
+      }
+    })
   }
 
   /**
@@ -1524,8 +1677,9 @@ export class PluginManager {
   private getStoredDetachedSize(pluginName: string): { width: number; height: number } | null {
     try {
       const sizes = api.dbGet('detachedWindowSizes')
-      if (sizes && typeof sizes === 'object' && !Array.isArray(sizes) && sizes[pluginName]) {
-        const rawSize = sizes[pluginName]
+      const sizeKey = getDetachedWindowSizeKey(pluginName)
+      if (sizes && typeof sizes === 'object' && !Array.isArray(sizes) && sizes[sizeKey]) {
+        const rawSize = sizes[sizeKey]
         const width = Number(rawSize?.width)
         const height = Number(rawSize?.height)
 
@@ -1564,6 +1718,7 @@ export class PluginManager {
       const pluginInfoFromDB = this.fetchPluginInfoFromDB(pluginPath)
       const pluginConfig = this.readPluginConfig(pluginPath)
       const isDevelopment = !!pluginInfoFromDB?.isDevelopment
+      const effectiveName = pluginInfoFromDB?.name || pluginConfig.name
       const { pluginUrl, isConfigHeadless } = this.resolvePluginUrl(
         pluginPath,
         pluginConfig,
@@ -1578,7 +1733,7 @@ export class PluginManager {
         ? path.join(pluginPath, pluginConfig.preload)
         : undefined
 
-      const sess = await this.setupPluginSession(pluginConfig.name)
+      const sess = await this.setupPluginSession(effectiveName, pluginPath)
       const pluginView = this.createPluginWebContentsView(sess, preloadPath)
 
       // 监听插件进程崩溃或退出
@@ -1590,14 +1745,14 @@ export class PluginManager {
         })
       })
 
-      const storedSize = this.getStoredDetachedSize(pluginConfig.name)
+      const storedSize = this.getStoredDetachedSize(effectiveName)
       const windowWidth = storedSize?.width ?? 800
       const viewHeight = storedSize?.height ?? this.pluginDefaultHeight
       const logoUrl = this.buildPluginLogoUrl(pluginPath, pluginConfig.logo)
 
       const detachedWindow = detachedWindowManager.createDetachedWindow(
         pluginPath,
-        pluginConfig.name,
+        effectiveName,
         pluginView,
         {
           width: windowWidth,
@@ -1631,7 +1786,10 @@ export class PluginManager {
         this.recordEnterState(pluginPath, featureCode)
       })
 
-      console.log('[Plugin] 插件已在独立窗口中创建:', pluginConfig.name)
+      console.log('[Plugin] 插件已在独立窗口中创建:', {
+        pluginName: effectiveName,
+        pluginPath
+      })
       return { success: true }
     } catch (error: unknown) {
       console.error('[Plugin] 在独立窗口中创建插件失败:', error)
@@ -1662,7 +1820,7 @@ export class PluginManager {
       const pluginJsonPath = path.join(this.currentPluginPath, 'plugin.json')
       const pluginConfig = JSON.parse(fsSync.readFileSync(pluginJsonPath, 'utf-8'))
 
-      const storedSize = this.getStoredDetachedSize(pluginConfig.name)
+      const storedSize = this.getStoredDetachedSize(cached.name)
       const defaultViewHeight = this.pluginDefaultHeight
 
       // 若存在历史尺寸则优先使用
@@ -1694,7 +1852,7 @@ export class PluginManager {
       // 使用新的分离窗口管理器创建窗口（使用缓存的搜索框状态）
       const detachedWindow = detachedWindowManager.createDetachedWindow(
         this.currentPluginPath,
-        pluginConfig.name,
+        cached.name,
         cached.view,
         {
           width: windowWidth,
@@ -1729,7 +1887,9 @@ export class PluginManager {
       this.pluginView = null
       this.currentPluginPath = null
 
-      console.log('[Plugin] 插件已分离到独立窗口:', pluginConfig.name)
+      console.log('[Plugin] 插件已分离到独立窗口:', {
+        pluginName: cached.name
+      })
       return { success: true }
     } catch (error: unknown) {
       console.error('[Plugin] 分离插件失败:', error)
@@ -1748,7 +1908,8 @@ export class PluginManager {
   public getPluginInfoByWebContents(webContents: WebContents): {
     name: string
     path: string
-    isInternal: boolean
+    canUseInternalApi: boolean
+    isBundledInternal: boolean
     logo?: string
   } | null {
     // 1. 先检查主窗口中的插件视图
@@ -1757,7 +1918,8 @@ export class PluginManager {
         return {
           name: pluginViewInfo.name,
           path: pluginViewInfo.path,
-          isInternal: isInternalPlugin(pluginViewInfo.name),
+          canUseInternalApi: canPluginUseInternalApi(pluginViewInfo.name),
+          isBundledInternal: isBundledInternalPlugin(pluginViewInfo.name),
           logo: pluginViewInfo.logo
         }
       }
@@ -1770,7 +1932,8 @@ export class PluginManager {
         return {
           name: windowInfo.pluginName,
           path: windowInfo.pluginPath,
-          isInternal: isInternalPlugin(windowInfo.pluginName)
+          canUseInternalApi: canPluginUseInternalApi(windowInfo.pluginName),
+          isBundledInternal: isBundledInternalPlugin(windowInfo.pluginName)
         }
       }
     }
@@ -1809,7 +1972,7 @@ export class PluginManager {
    */
   public isInternalPluginCaller(event: Electron.IpcMainInvokeEvent): boolean {
     const pluginInfo = this.getPluginInfoByWebContents(event.sender)
-    return pluginInfo?.isInternal ?? false
+    return pluginInfo?.canUseInternalApi ?? false
   }
 
   /**

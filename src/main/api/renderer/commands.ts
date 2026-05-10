@@ -39,6 +39,12 @@ export class AppsAPI {
   private isLocalAppSearchEnabled = true
   private cachedCommandsResult: { commands: any[]; regexCommands: any[]; plugins: any[] } | null =
     null
+  /** 由外部注入，用于在多屏场景下正确显示窗口（跟随光标所在屏幕） */
+  private showWindowCallback?: () => void
+
+  public setShowWindowCallback(callback: () => void): void {
+    this.showWindowCallback = callback
+  }
 
   /**
    * 安全地向渲染进程发送消息
@@ -60,6 +66,16 @@ export class AppsAPI {
 
   public getLaunchParam(): any {
     return this.launchParam
+  }
+
+  public invalidateCommandsCache(notifyRenderer = false): void {
+    this.cachedCommandsResult = null
+    console.log('[Commands] 指令缓存已清空:', { notifyRenderer })
+
+    if (notifyRenderer) {
+      console.log('[Commands] 发送 apps-changed 通知，触发主窗口重载指令与 alias 搜索索引')
+      this.notifyRenderer('apps-changed')
+    }
   }
 
   /**
@@ -108,11 +124,8 @@ export class AppsAPI {
    */
   public setLocalAppSearch(enabled: boolean): void {
     this.isLocalAppSearchEnabled = enabled
-    this.cachedCommandsResult = null
+    this.invalidateCommandsCache(true)
     console.log('[Commands] 本地应用搜索已' + (enabled ? '开启' : '关闭'))
-
-    // 通知渲染进程应用列表已更新
-    this.notifyRenderer('apps-changed')
   }
 
   /**
@@ -263,14 +276,92 @@ export class AppsAPI {
     console.log('[Commands] 开始刷新应用缓存...')
     try {
       await this.scanAndCacheApps()
-      this.cachedCommandsResult = null
+      this.invalidateCommandsCache(true)
       console.log('[Commands] 应用缓存刷新成功')
-
-      // 通知渲染进程应用列表已更新
-      this.notifyRenderer('apps-changed')
     } catch (error) {
       console.error('[Commands] 刷新应用缓存失败:', error)
     }
+  }
+
+  /**
+   * 纯启动编排：负责管理插件载入前的主窗口占位、自动分离、复用已分离窗口等逻辑
+   */
+  private async preparePluginLaunch(
+    options: {
+      path: string
+      featureCode: string
+      name?: string
+    },
+    pluginConfig: any
+  ): Promise<{ success: boolean; error?: string }> {
+    if (!this.pluginManager) {
+      return { success: false, error: 'Plugin Manager 未初始化' }
+    }
+    const { path: appPath, featureCode, name } = options
+    const plugin = this.getPluginsFromDB().find((p: any) => p.path === appPath)
+    const effectiveName = plugin?.name
+    // 检查是否配置为自动分离
+    let shouldAutoDetach = false
+    if (pluginConfig && effectiveName) {
+      try {
+        const autoDetachPlugins: string[] = databaseAPI.dbGet('autoDetachPlugin') || []
+        if (Array.isArray(autoDetachPlugins) && autoDetachPlugins.includes(effectiveName)) {
+          shouldAutoDetach = true
+          console.log(`插件 ${effectiveName} 配置为自动分离，直接在独立窗口中创建`)
+        }
+      } catch (error) {
+        console.error('[Commands] 检查自动分离配置失败:', error)
+      }
+    }
+
+    // 先预检查目标插件是否已在分离窗口中运行。
+    // 这里必须发生在主窗口 show / placeholder 之前，否则“只是聚焦已有分离窗口”的场景也会把主窗口 UI 弄脏。
+    const reusedDetached = await this.pluginManager.reuseDetachedSingletonIfExists(
+      appPath,
+      featureCode,
+      'launch-precheck'
+    )
+
+    if (reusedDetached) {
+      console.log('[Commands] 目标插件已在分离窗口运行，跳过主窗口占位态:', {
+        path: appPath,
+        featureCode
+      })
+      return { success: true }
+    }
+
+    if (shouldAutoDetach) {
+      const result = await this.pluginManager.createPluginInDetachedWindow(appPath, featureCode)
+
+      if (!result.success) {
+        console.error('[Commands] 在独立窗口中创建插件失败:', result.error)
+        // 如果创建失败，降级到主窗口模式
+        this.notifyRenderer('show-plugin-placeholder')
+        await this.pluginManager.createPluginView(appPath, featureCode, name)
+      } else {
+        // 创建成功，隐藏主窗口
+        this.mainWindow?.hide()
+      }
+    } else {
+      // 先通知渲染进程切换到插件视图模式
+      // 必须在 show() 之前发送，否则 show() 触发的 focus-search 事件
+      // 会在渲染进程中因 currentView 仍为 Search 而调用 hidePlugin()
+      this.notifyRenderer('show-plugin-placeholder')
+      // 检查主窗口是否可见
+      if (!this.mainWindow?.isVisible()) {
+        // 使用注入的回调（会跟随光标所在屏幕），降级到直接 show()
+        if (this.showWindowCallback) {
+          this.showWindowCallback()
+        } else {
+          this.mainWindow?.show()
+        }
+      }
+
+      // 在主窗口中创建插件
+      await this.pluginManager.createPluginView(appPath, featureCode, name)
+    }
+
+    return { success: true }
   }
 
   /**
@@ -292,6 +383,9 @@ export class AppsAPI {
     try {
       // 判断是插件还是直接启动
       if (type === 'plugin') {
+        if (pluginsAPI.isPluginDisabled(appPath)) {
+          return { success: false, error: '插件已禁用' }
+        }
         // 如果没有传 featureCode，自动查找第一个非匹配 feature
         if (!featureCode) {
           const result = await this.getDefaultFeatureCode(appPath)
@@ -374,76 +468,14 @@ export class AppsAPI {
             param
           )
         }
-
-        // 普通插件：创建插件视图
-        if (this.pluginManager) {
-          // 检查是否配置为自动分离
-          let shouldAutoDetach = false
-          if (pluginConfig) {
-            try {
-              const autoDetachPlugins = databaseAPI.dbGet('autoDetachPlugin')
-              if (
-                autoDetachPlugins &&
-                Array.isArray(autoDetachPlugins) &&
-                autoDetachPlugins.includes(pluginConfig.name)
-              ) {
-                shouldAutoDetach = true
-                console.log(`插件 ${pluginConfig.name} 配置为自动分离，直接在独立窗口中创建`)
-              }
-            } catch (error) {
-              console.error('[Commands] 检查自动分离配置失败:', error)
-            }
-          }
-
-          // 先预检查目标插件是否已在分离窗口中运行。
-          // 这里必须发生在主窗口 show / placeholder 之前，否则“只是聚焦已有分离窗口”的场景也会把主窗口 UI 弄脏。
-          const reusedDetached =
-            typeof (this.pluginManager as any).reuseDetachedSingletonIfExists === 'function'
-              ? await (this.pluginManager as any).reuseDetachedSingletonIfExists(
-                  appPath,
-                  featureCode || '',
-                  'launch-precheck'
-                )
-              : false
-
-          if (reusedDetached) {
-            console.log('[Commands] 目标插件已在分离窗口运行，跳过主窗口占位态:', {
-              path: appPath,
-              featureCode
-            })
-            return { success: true }
-          }
-
-          if (shouldAutoDetach) {
-            // 直接在独立窗口中创建插件
-            const result = await this.pluginManager.createPluginInDetachedWindow(
-              appPath,
-              featureCode || ''
-            )
-
-            if (!result.success) {
-              console.error('[Commands] 在独立窗口中创建插件失败:', result.error)
-              // 如果创建失败，降级到主窗口模式
-              this.notifyRenderer('show-plugin-placeholder')
-              await this.pluginManager.createPluginView(appPath, featureCode || '', name)
-            } else {
-              // 创建成功，隐藏主窗口
-              this.mainWindow?.hide()
-            }
-          } else {
-            // 检查主窗口是否可见
-            if (!this.mainWindow?.isVisible()) {
-              this.mainWindow?.show()
-            }
-            // 通知渲染进程准备显示插件占位区域
-            this.notifyRenderer('show-plugin-placeholder')
-
-            // 在主窗口中创建插件
-            await this.pluginManager.createPluginView(appPath, featureCode || '', name)
-          }
-        }
-
-        return { success: true }
+        return await this.preparePluginLaunch(
+          {
+            path: appPath,
+            featureCode: featureCode || '',
+            name
+          },
+          pluginConfig
+        )
       } else if (type === 'file') {
         // 文件/文件夹类型：在文件管理器中定位
         console.log('[Commands] 在文件管理器中定位:', appPath)
@@ -452,6 +484,8 @@ export class AppsAPI {
         // 添加到历史记录
         this.addToHistory({ path: appPath, type: 'file', name, cmdType: 'text' })
 
+        // 隐藏当前插件视图（如果有）
+        this.pluginManager?.hidePluginView()
         // 通知渲染进程应用已启动（清空搜索框等）
         this.notifyRenderer('app-launched')
         this.mainWindow?.hide()
@@ -475,6 +509,8 @@ export class AppsAPI {
         // 添加到历史记录
         this.addToHistory({ path: appPath, type: 'app', name, cmdType: 'text' })
 
+        // 隐藏当前插件视图（如果有）
+        this.pluginManager?.hidePluginView()
         // 通知渲染进程应用已启动（清空搜索框等）
         this.notifyRenderer('app-launched')
         this.mainWindow?.hide()
@@ -532,6 +568,8 @@ export class AppsAPI {
       // 添加到历史记录
       this.addToHistory({ path: appPath, type: 'app', name, cmdType: 'text' })
 
+      // 隐藏当前插件视图（如果有）
+      this.pluginManager?.hidePluginView()
       // 通知渲染进程应用已启动
       this.notifyRenderer('app-launched')
       this.mainWindow?.hide()
@@ -593,7 +631,7 @@ export class AppsAPI {
 
             // 如果在 plugin.json 中没找到，尝试从动态 features 中查找
             if (!feature) {
-              const dynamicFeatures = pluginFeatureAPI.loadDynamicFeatures(pluginConfig.name)
+              const dynamicFeatures = pluginFeatureAPI.loadDynamicFeatures(plugin.name)
               feature = dynamicFeatures.find((f: any) => f.code === featureCode)
             }
 
@@ -611,9 +649,9 @@ export class AppsAPI {
               icon: featureIcon,
               type: 'plugin',
               featureCode: featureCode,
-              pluginName: pluginConfig.name, // ✅ 添加插件名称
+              pluginName: plugin.name, // 有效名（开发版含 __dev 后缀）
               pluginExplain: feature?.explain || '',
-              cmdType: cmdType || 'text' // ✅ 添加 cmdType
+              cmdType: cmdType || 'text'
             }
           } catch (error) {
             console.error('[Commands] 读取插件配置失败:', error)
@@ -678,15 +716,24 @@ export class AppsAPI {
       const history: any[] = databaseAPI.dbGet('command-history') || []
 
       // 查找是否已存在（非插件类型需要同时匹配 name 和 path，支持同路径不同名应用）
-      const existingIndex = findCommandIndex(history, appPath, type, featureCode, appInfo.name)
+      const existingIndex = findCommandIndex(
+        history,
+        appPath,
+        type,
+        featureCode,
+        appInfo.pluginName || appInfo.name
+      )
 
       if (existingIndex >= 0) {
         // 已存在，更新使用时间和次数
         history[existingIndex].lastUsed = now
         history[existingIndex].useCount = (history[existingIndex].useCount || 0) + 1
-        // 更新可能变化的信息
+        // 更新可能变化的信息（包括 path，确保开发/生产模式切换后路径同步）
+        history[existingIndex].path = appInfo.path
         history[existingIndex].name = appInfo.name
         history[existingIndex].icon = appInfo.icon
+        history[existingIndex].pluginName = appInfo.pluginName
+        history[existingIndex].pluginExplain = appInfo.pluginExplain
       } else {
         // 新记录
         history.push({
@@ -833,7 +880,6 @@ export class AppsAPI {
     try {
       const originalHistory: any[] = databaseAPI.dbGet('command-history') || []
 
-      // 过滤掉要删除的项（非插件类型需要同时匹配 name 和 path，支持同路径不同名应用）
       const history = filterOutCommand(originalHistory, appPath, featureCode, name)
 
       databaseAPI.dbPut('command-history', history)
@@ -849,12 +895,12 @@ export class AppsAPI {
   /**
    * 固定应用
    */
-  private pinApp(app: any): void {
+  public pinApp(app: any): void {
     try {
       const pinnedApps: any[] = databaseAPI.dbGet('pinned-commands') || []
 
       // 检查是否已固定（非插件类型需要同时匹配 name 和 path，支持同路径不同名应用）
-      const exists = hasCommand(pinnedApps, app.path, app.featureCode, app.name)
+      const exists = hasCommand(pinnedApps, app.path, app.featureCode, app.pluginName || app.name)
 
       if (exists) {
         console.log('[Commands] 应用已固定:', app.path)
@@ -887,11 +933,10 @@ export class AppsAPI {
   /**
    * 取消固定
    */
-  private unpinApp(appPath: string, featureCode?: string, name?: string): void {
+  public unpinApp(appPath: string, featureCode?: string, name?: string): void {
     try {
       const originalPinnedApps: any[] = databaseAPI.dbGet('pinned-commands') || []
 
-      // 过滤掉要删除的项（非插件类型需要同时匹配 name 和 path，支持同路径不同名应用）
       const pinnedApps = filterOutCommand(originalPinnedApps, appPath, featureCode, name)
 
       databaseAPI.dbPut('pinned-commands', pinnedApps)
@@ -918,7 +963,8 @@ export class AppsAPI {
         featureCode: app.featureCode,
         pluginExplain: app.pluginExplain,
         pinyin: app.pinyin,
-        pinyinAbbr: app.pinyinAbbr
+        pinyinAbbr: app.pinyinAbbr,
+        pluginName: app.pluginName
       }))
 
       databaseAPI.dbPut('pinned-commands', cleanData)
@@ -975,20 +1021,22 @@ export class AppsAPI {
   }
 
   /**
-   * 获取所有指令（供 AllCommands 页面使用）
+   * 获取所有指令（供 AllCommands 页面和设置页 alias 目标选择使用）
    * 返回处理后的 commands、regexCommands 和 plugins
-   * 结果会被缓存，直到应用列表或插件发生变化时清除
+   * 结果会被缓存，直到应用列表、插件状态或 alias 映射发生变化时清除
    */
-  private async getCommands(): Promise<{
+  public async getCommands(): Promise<{
     commands: any[]
     regexCommands: any[]
     plugins: any[]
   }> {
     // 命中缓存直接返回
     if (this.cachedCommandsResult) {
+      console.log('[Commands] 命中指令缓存，直接返回 getCommands 结果')
       return this.cachedCommandsResult
     }
 
+    console.log('[Commands] 指令缓存未命中，开始重建 getCommands 结果')
     try {
       const rawApps = await this.getApps()
 
@@ -1039,7 +1087,7 @@ export class AppsAPI {
         console.error('[Commands] 获取本地启动项失败:', error)
       }
 
-      // 处理插件指令
+      // 处理插件指令。
       for (const plugin of plugins) {
         if (!plugin.features || !Array.isArray(plugin.features)) {
           continue
@@ -1088,6 +1136,11 @@ export class AppsAPI {
 
       const result = { commands, regexCommands, plugins }
       this.cachedCommandsResult = result
+      console.log('[Commands] 指令列表重建完成:', {
+        commands: commands.length,
+        regexCommands: regexCommands.length,
+        plugins: plugins.length
+      })
       return result
     } catch (error) {
       console.error('[Commands] 获取指令列表失败:', error)
